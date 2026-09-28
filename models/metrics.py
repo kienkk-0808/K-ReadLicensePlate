@@ -27,7 +27,7 @@ def _voc_ap(recall: np.ndarray, precision: np.ndarray) -> float:
 def evaluate_metrics(
     model, val_loader, device,
     score_thr: float = 0.05, nms_iou: float = 0.5, map_iou: float = 0.5,
-    num_classes: int = 2,
+    num_classes: int = 1,
 ) -> Dict[str, float]:
     """Chạy model trên toàn bộ val_loader, trả về:
         {"mAP50": ..., "kps_nme": ..., "AP50_class_<i>": ...}

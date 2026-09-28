@@ -63,7 +63,7 @@ def main():
     img_size = args.img_size or ckpt_args.get("img_size", 640)
     width_mult = args.width_mult or ckpt_args.get("width_mult", 1.0)
     fpn_channels = args.fpn_channels or ckpt_args.get("fpn_channels", 32)
-    num_classes = args.num_classes or ckpt_args.get("num_classes", 2)
+    num_classes = args.num_classes or ckpt_args.get("num_classes", 1)
 
     print(f"[config] img_size={img_size} width_mult={width_mult} "
           f"fpn_channels={fpn_channels} num_classes={num_classes}")

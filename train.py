@@ -15,19 +15,27 @@ Chiến lược "elitist" (mặc định bật, tắt bằng --no-elitist):
 
         composite_score = mAP50 - kps_weight * min(kps_nme, 1.0)   (--kps-weight, mặc định 0.5)
 
-    - Nếu composite_score CAO HƠN best hiện tại -> lưu làm best.pt, tiếp tục train
-      bình thường từ trọng số hiện tại (đang là best).
-    - Nếu KHÔNG cải thiện -> nạp lại trọng số + optimizer state từ best.pt trước khi
-      bắt đầu epoch kế tiếp ("lấy best ra train tiếp"), tránh việc 1 epoch tệ (do
-      augmentation ngẫu nhiên xấu, LR nhảy...) kéo lùi cả quá trình học trên tập dữ
-      liệu nhỏ (~1000 ảnh). LR scheduler vẫn tiến bình thường theo epoch, không bị
-      reset khi revert.
+    - Nếu composite_score CAO HƠN best hiện tại -> lưu làm best.pt, reset bộ đếm
+      "số epoch chưa cải thiện" về 0, tiếp tục train bình thường.
+    - Nếu KHÔNG cải thiện -> KHÔNG revert ngay. Chỉ sau khi đủ `--patience` (mặc
+      định 5) epoch LIÊN TIẾP không cải thiện mới nạp lại trọng số + optimizer từ
+      best.pt ("lấy best ra train tiếp"). Lý do đổi từ revert-ngay-lập-tức sang có
+      patience: tập valid chỉ ~165 ảnh, mAP có thể dao động do nhiễu (augmentation,
+      NMS biên) chứ chưa chắc là plateau thật — revert ngay mỗi epoch không cải
+      thiện dễ khiến optimizer bị "đóng băng" quanh 1 điểm hội tụ sớm, không có cơ
+      hội đi xuyên qua nhiễu ngắn hạn để tìm điểm tốt hơn (quan sát thực tế: 1 lần
+      train 70 epoch với revert-ngay, best rơi ở epoch 38, 31 epoch sau đó không hề
+      cải thiện — dấu hiệu bị kẹt tại cực trị cục bộ do revert quá sớm/quá thường xuyên).
+    - `composite_ema` (làm mượt theo `--ema-alpha`) được ghi vào metrics.csv chỉ để
+      QUAN SÁT xu hướng thật khi vẽ đồ thị — không dùng để quyết định best/revert.
+    LR scheduler vẫn tiến bình thường theo epoch, không bị reset khi revert.
     Lưu ý: chiến lược này đánh đổi tốc độ hội tụ lấy sự ổn định — phù hợp dataset nhỏ,
     dễ overfit/nhiễu; với dataset lớn hơn nhiều có thể tắt (--no-elitist) để train
     theo kiểu thông thường (luôn tiếp tục từ epoch vừa train xong).
 """
 
 import argparse
+import csv
 import time
 from pathlib import Path
 
@@ -50,7 +58,9 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--width-mult", type=float, default=1.0)
     p.add_argument("--fpn-channels", type=int, default=32)
-    p.add_argument("--num-classes", type=int, default=2)
+    p.add_argument("--num-classes", type=int, default=1,
+                    help="1 = gộp mọi loại biển thành 1 class (mặc định, tối ưu model, "
+                         "chỉ cần bbox+kps); đổi lại 2 nếu muốn phân biệt plate-1-line/plate-2-line")
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--output-dir", type=str, default="runs/scrfd_mbf")
@@ -60,6 +70,12 @@ def parse_args():
     p.add_argument("--no-augment", action="store_true", help="Tắt augmentation cho tập train")
     p.add_argument("--no-elitist", action="store_true",
                     help="Tắt chiến lược revert-to-best sau mỗi epoch không cải thiện")
+    p.add_argument("--patience", type=int, default=5,
+                    help="Số epoch liên tiếp KHÔNG cải thiện composite_score trước khi revert "
+                         "về best.pt (thay vì revert ngay lập tức) — chống nhiễu từ tập valid nhỏ")
+    p.add_argument("--ema-alpha", type=float, default=0.3,
+                    help="Hệ số EMA làm mượt composite_score khi ghi log CSV (chỉ để quan sát xu "
+                         "hướng thật, không dùng để quyết định best/revert)")
     p.add_argument("--map-iou", type=float, default=0.5, help="Ngưỡng IoU dùng để tính mAP")
     p.add_argument("--nms-iou", type=float, default=0.5, help="Ngưỡng IoU dùng để NMS lúc eval")
     p.add_argument("--kps-weight", type=float, default=0.5,
@@ -122,6 +138,21 @@ def main():
     train_loader, val_loader = build_dataloaders(args)
     print(f"[data] train batches/epoch: {len(train_loader)} | val batches: {len(val_loader)}")
 
+    metrics_csv_path = output_dir / "metrics.csv"
+    csv_fieldnames = [
+        "epoch", "lr", "train_loss", "train_cls", "train_bbox", "train_kps",
+        "val_loss", "mAP50", "kps_nme", "composite_score", "composite_ema",
+        "is_best", "reverted", "epochs_since_improve",
+    ]
+    # Nếu resume, giữ nguyên log cũ (append); nếu train mới, ghi đè + viết header.
+    if not args.resume or not metrics_csv_path.exists():
+        with open(metrics_csv_path, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=csv_fieldnames).writeheader()
+
+    def log_epoch_csv(row: dict):
+        with open(metrics_csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=csv_fieldnames).writerow(row)
+
     model = SCRFD_MBF(
         width_mult=args.width_mult, fpn_channels=args.fpn_channels,
         num_classes=args.num_classes,
@@ -139,6 +170,8 @@ def main():
 
     start_epoch = 0
     best_map = -1.0
+    epochs_since_improve = 0
+    composite_ema = None
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
@@ -153,6 +186,7 @@ def main():
         model.train()
         epoch_start = time.time()
         running = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0, "kps_loss": 0.0}
+        epoch_totals = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0, "kps_loss": 0.0}
 
         for step, (imgs, targets) in enumerate(train_loader):
             imgs = imgs.to(device)
@@ -168,6 +202,7 @@ def main():
 
             for k in running:
                 running[k] += loss_dict[k].item()
+                epoch_totals[k] += loss_dict[k].item()
 
             if (step + 1) % args.log_interval == 0:
                 n = args.log_interval
@@ -183,9 +218,23 @@ def main():
 
         scheduler.step()
         elapsed = time.time() - epoch_start
-        print(f"[epoch {epoch}] xong sau {elapsed:.1f}s, lr={scheduler.get_last_lr()[0]:.6f}")
+        cur_lr = scheduler.get_last_lr()[0]
+        print(f"[epoch {epoch}] xong sau {elapsed:.1f}s, lr={cur_lr:.6f}")
 
-        if (epoch + 1) % args.val_interval == 0:
+        num_steps = len(train_loader)
+        epoch_avg = {k: v / num_steps for k, v in epoch_totals.items()}
+
+        did_eval = (epoch + 1) % args.val_interval == 0
+        if not did_eval:
+            log_epoch_csv({
+                "epoch": epoch, "lr": cur_lr,
+                "train_loss": epoch_avg["loss"], "train_cls": epoch_avg["cls_loss"],
+                "train_bbox": epoch_avg["bbox_loss"], "train_kps": epoch_avg["kps_loss"],
+                "val_loss": "", "mAP50": "", "kps_nme": "", "composite_score": "",
+                "composite_ema": "", "is_best": "", "reverted": "", "epochs_since_improve": "",
+            })
+
+        if did_eval:
             val_loss_metrics = evaluate(model, loss_fn, val_loader, device)
             det_metrics = evaluate_metrics(
                 model, val_loader, device,
@@ -199,10 +248,16 @@ def main():
             composite_score = det_metrics["mAP50"] - args.kps_weight * kps_penalty
             det_metrics["composite_score"] = composite_score
 
+            composite_ema = (
+                composite_score if composite_ema is None
+                else args.ema_alpha * composite_score + (1 - args.ema_alpha) * composite_ema
+            )
+
             print(
                 f"[epoch {epoch}] VAL loss={val_loss_metrics['loss']:.4f} "
                 f"| mAP@{args.map_iou:.2f}={det_metrics['mAP50']:.4f} "
-                f"kps_nme={kps_nme:.4f} composite={composite_score:.4f}"
+                f"kps_nme={kps_nme:.4f} composite={composite_score:.4f} "
+                f"(ema={composite_ema:.4f})"
             )
 
             last_ckpt = {
@@ -217,28 +272,52 @@ def main():
             }
             torch.save(last_ckpt, output_dir / "last.pt")
 
-            if composite_score > best_map:
+            is_best = composite_score > best_map
+            reverted = False
+
+            if is_best:
                 best_map = composite_score
+                epochs_since_improve = 0
                 last_ckpt["best_map"] = best_map
                 torch.save(last_ckpt, output_dir / "best.pt")
                 print(
                     f"[epoch {epoch}] best model moi, composite={best_map:.4f} "
                     f"(mAP@{args.map_iou:.2f}={det_metrics['mAP50']:.4f}, kps_nme={kps_nme:.4f})"
                 )
-            elif not args.no_elitist:
-                # Epoch này không cải thiện composite_score -> nạp lại trọng số + optimizer
-                # từ best.pt trước khi bước sang epoch kế tiếp ("lấy best ra train tiếp").
-                best_path = output_dir / "best.pt"
-                if best_path.exists():
-                    best_ckpt = torch.load(best_path, map_location=device)
-                    model.load_state_dict(best_ckpt["model"])
-                    optimizer.load_state_dict(best_ckpt["optimizer"])
-                    print(
-                        f"[epoch {epoch}] khong cai thien (composite={composite_score:.4f} "
-                        f"<= best={best_map:.4f}) -> nap lai trong so best.pt cho epoch sau"
-                    )
+            else:
+                epochs_since_improve += 1
+                print(
+                    f"[epoch {epoch}] khong cai thien (composite={composite_score:.4f} "
+                    f"<= best={best_map:.4f}) — {epochs_since_improve}/{args.patience} epoch chua cai thien"
+                )
+                if not args.no_elitist and epochs_since_improve >= args.patience:
+                    # Đủ `patience` epoch liên tiếp không cải thiện -> mới thực sự coi là
+                    # plateau (không phải nhiễu 1 epoch từ tập valid nhỏ) -> nạp lại trọng
+                    # số + optimizer từ best.pt rồi reset bộ đếm ("lấy best ra train tiếp").
+                    best_path = output_dir / "best.pt"
+                    if best_path.exists():
+                        best_ckpt = torch.load(best_path, map_location=device)
+                        model.load_state_dict(best_ckpt["model"])
+                        optimizer.load_state_dict(best_ckpt["optimizer"])
+                        reverted = True
+                        epochs_since_improve = 0
+                        print(
+                            f"[epoch {epoch}] du {args.patience} epoch khong cai thien "
+                            f"-> nap lai trong so best.pt cho epoch sau"
+                        )
+
+            log_epoch_csv({
+                "epoch": epoch, "lr": cur_lr,
+                "train_loss": epoch_avg["loss"], "train_cls": epoch_avg["cls_loss"],
+                "train_bbox": epoch_avg["bbox_loss"], "train_kps": epoch_avg["kps_loss"],
+                "val_loss": val_loss_metrics["loss"], "mAP50": det_metrics["mAP50"],
+                "kps_nme": kps_nme, "composite_score": composite_score,
+                "composite_ema": composite_ema, "is_best": int(is_best), "reverted": int(reverted),
+                "epochs_since_improve": epochs_since_improve,
+            })
 
     print("Huấn luyện hoàn tất.")
+    print(f"[log] toàn bộ đường cong train/val đã lưu tại: {metrics_csv_path}")
 
 
 if __name__ == "__main__":

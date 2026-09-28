@@ -57,7 +57,7 @@ def load_torch_model(checkpoint_path: str, img_size_override: int):
     model = SCRFD_MBF(
         width_mult=args.get("width_mult", 1.0),
         fpn_channels=args.get("fpn_channels", 32),
-        num_classes=args.get("num_classes", 2),
+        num_classes=args.get("num_classes", 1),
     )
     model.load_state_dict(ckpt["model"])
     model.eval()

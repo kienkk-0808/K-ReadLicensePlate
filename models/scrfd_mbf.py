@@ -154,7 +154,7 @@ class SCRFDHead(nn.Module):
     """Head anchor-free dùng chung trọng số giữa các level P3/P4/P5."""
 
     def __init__(self, in_channels: int = 32, stacked_convs: int = 1, num_groups: int = 8,
-                 num_classes: int = 2):
+                 num_classes: int = 1):
         super().__init__()
         self.num_classes = num_classes
 
@@ -216,7 +216,7 @@ class SCRFDHead(nn.Module):
 class SCRFD_MBF(nn.Module):
     """Model tổng hợp: MBF backbone -> PAFPN -> SCRFD head (4 keypoint góc biển số)."""
 
-    def __init__(self, width_mult: float = 1.0, fpn_channels: int = 32, num_classes: int = 2):
+    def __init__(self, width_mult: float = 1.0, fpn_channels: int = 32, num_classes: int = 1):
         super().__init__()
         self.backbone = MBFBackbone(width_mult=width_mult)
         self.neck = PAFPN(self.backbone.out_channels, out_channels=fpn_channels)
@@ -306,7 +306,7 @@ def sort_corners(kps: torch.Tensor) -> torch.Tensor:
 
 
 if __name__ == "__main__":
-    model = SCRFD_MBF(width_mult=1.0, fpn_channels=32, num_classes=2)
+    model = SCRFD_MBF(width_mult=1.0, fpn_channels=32, num_classes=1)
     dummy = torch.randn(1, 3, 640, 640)
     outs = model(dummy)
     for i, (cls_s, bbox_d, kps_o) in enumerate(outs):

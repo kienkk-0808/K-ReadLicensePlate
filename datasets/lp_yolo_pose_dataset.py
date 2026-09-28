@@ -14,7 +14,11 @@ Format label (mỗi dòng .txt, giống dataset/data.yaml):
     target train, ta sắp xếp lại bằng sort_corners() (models/scrfd_mbf.py) để ép
     về thứ tự nhất quán TL->TR->BR->BL, tránh mô hình học nhầm hoán vị góc.
 
-nc=2: 'plate-1-line' (biển 1 dòng), 'plate-2-line' (biển 2 dòng)
+Dataset gốc có nc=2 ('plate-1-line', 'plate-2-line'), nhưng loader này GỘP về 1 class
+duy nhất ("plate") — bài toán thực tế chỉ cần bbox + 4 keypoint để crop/warp biển số
+đưa qua OCR, không cần phân biệt 1 dòng/2 dòng ở bước detect (việc đó OCR/logic sau
+tự suy ra từ hình dạng box), nên bỏ phân loại 2 lớp để giảm tải cho nhánh cls, tối ưu
+model (nhẹ hơn, hội tụ nhanh hơn vì không phải học ranh giới 2 class dễ nhầm lẫn).
 
 Pipeline xử lý 1 ảnh (split="train", augment=True):
     đọc ảnh + label (pixel gốc) -> augment hình học (flip/affine) + màu (hsv)
@@ -36,7 +40,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from models.scrfd_mbf import sort_corners, NUM_KPS  # noqa: E402
 from datasets.augmentations import train_augment  # noqa: E402
 
-CLASS_NAMES = ["plate-1-line", "plate-2-line"]
+CLASS_NAMES = ["plate"]
 
 
 def letterbox(img: np.ndarray, new_size: int = 640, pad_value: int = 114):
@@ -130,7 +134,8 @@ class LicensePlateYoloPoseDataset(Dataset):
             boxes = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
             boxes = boxes.astype(np.float32)
 
-            labels = np.array([o["class_id"] for o in objects], dtype=np.int64)
+            # Gộp toàn bộ về class 0 ("plate") — xem ghi chú đầu file.
+            labels = np.zeros(num_obj, dtype=np.int64)
 
             kps = np.array([
                 [(kx * orig_w, ky * orig_h) for (kx, ky, kv) in o["kps"]]
