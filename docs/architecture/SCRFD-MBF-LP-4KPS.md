@@ -42,33 +42,36 @@ Backbone gốc MobileFaceNet dùng cho face recognition (embedding), ở đây �
 
 ### Cấu trúc các stage
 
+> **Cập nhật (sau khi đo FLOPs thực tế):** bản thiết kế đầu tiên (24 block, downsample chậm) nặng **16.7 GFLOPs @640x640** — gấp ~33 lần SCRFD_500M gốc (~500 MFLOPs), khiến inference CPU mất ~400ms/ảnh dù backbone cùng "họ" MobileFaceNet. Nguyên nhân: downsample quá chậm (giữ stride 2 quá lâu trước khi vào block), quá nhiều block (24) và expand ratio cao (4x) áp dụng ở feature map độ phân giải lớn. Bảng dưới là bản đã tinh gọn lại theo đúng ngân sách "500M-1G class".
+
 | Stage | Input stride | Output stride | Block | Số block | Channels (t=expand, c=out) |
 |---|---|---|---|---|---|
-| Stem | 1 | 2 | Conv3x3 s2 + PReLU | 1 | c=32 |
-| DW-stem | 2 | 2 | Depthwise Conv3x3 (residual sau) | 1 | c=32 (depthwise, groups=32) |
-| Stage1 | 2 | 4 | Inverted Residual (bottleneck) | 4 | t=2, c=64 |
-| Stage2 | 4 | 8 | Inverted Residual | 6 | t=4, c=64 → **C3 (stride 8)** |
-| Stage3 | 8 | 16 | Inverted Residual | 8 | t=4, c=128 → **C4 (stride 16)** |
-| Stage4 | 16 | 32 | Inverted Residual | 6 | t=4, c=128 → **C5 (stride 32)** |
-| Conv-final | 32 | 32 | Conv1x1 + PReLU | 1 | c=256 (chỉ dùng nếu cần thêm ngữ nghĩa cho C5) |
+| Stem | 1 | 2 | Conv3x3 s2 + PReLU | 1 | c=16 |
+| DW-stem | 2 | 4 | Depthwise Conv3x3 s2 | 1 | c=16 (depthwise, groups=16) |
+| Stage1 | 4 | 8 | Inverted Residual (bottleneck) | 2 | t=2, c=32 → **C3 (stride 8)** |
+| Stage2 | 8 | 16 | Inverted Residual | 3 | t=2, c=64 → **C4 (stride 16)** |
+| Stage3 | 16 | 32 | Inverted Residual | 2 | t=4, c=64 → **C5 (stride 32)** |
 
+- Downsample đạt stride 4 chỉ sau 2 layer đầu (stem + dw-stem đều stride 2) — giảm compute sớm, đúng tinh thần backbone "500M-class" (khác bản đầu giữ stride 2 qua nhiều layer).
+- Tổng chỉ còn **7 block** (thay vì 24), expand ratio thấp (2x) ở 2 stage đầu — chỉ dùng 4x ở stage cuối (C5, feature map đã nhỏ 20x20 nên chi phí thấp).
 - Activation: **PReLU** toàn bộ (đặc trưng của MobileFaceNet, khác ReLU6 của MobileNetV2 gốc).
 - BatchNorm sau mỗi conv (trước activation).
-- Không dùng SE-block để giữ nhẹ (có thể bật SE ở Stage3/4 nếu cần tăng độ chính xác, đánh đổi FLOPs).
 - 3 output feature map cần lấy ra cho neck: **C3 (stride 8), C4 (stride 16), C5 (stride 32)**.
 
-### Biến thể độ nặng (width multiplier)
+### Biến thể độ nặng (width multiplier) — đo FLOPs thực tế bằng `thop`
 
-| Biến thể | Width multiplier | Use case |
-|---|---|---|
-| MBF-0.5 | 0.5x | Camera AI edge, NPU giới hạn (RK3568/RV1126) |
-| MBF-1.0 | 1.0x (mặc định, bảng trên) | Server/Jetson, cần độ chính xác cao hơn |
+| Biến thể | Width multiplier | fpn_channels | Tổng FLOPs @640x640 | Use case |
+|---|---|---|---|---|
+| MBF-0.5 | 0.5x | 32 | ~0.94 GFLOPs | Camera AI edge, NPU giới hạn (RK3568/RV1126) |
+| MBF-1.0 | 1.0x (mặc định) | 32 | ~1.29 GFLOPs | Server/Jetson, cần độ chính xác cao hơn |
+
+Bản đầu (16.7 GFLOPs) chạy ~400ms/ảnh trên CPU thường; bản đã tinh gọn (1.29 GFLOPs) chạy **~26ms/ảnh** cùng điều kiện — nhanh hơn ~15 lần, đúng bằng tỉ lệ giảm FLOPs.
 
 ## 4. Neck — PAFPN (Path Aggregation FPN)
 
 Giống SCRFD gốc: top-down (semantic từ C5 xuống C3) + bottom-up (chi tiết từ C3 lên C5), giúp feature map nhỏ (P3, dùng để phát hiện biển số nhỏ/xa) vẫn có ngữ nghĩa tốt.
 
-- Lateral conv 1x1: đưa C3/C4/C5 về cùng số kênh `fpn_channels` (khuyến nghị 64 cho bản nhẹ, 96 cho bản chuẩn).
+- Lateral conv 1x1: đưa C3/C4/C5 về cùng số kênh `fpn_channels` (mặc định **32** — đã giảm từ 64 ban đầu, vì head áp dụng conv dày đặc trên P3 80x80 nên chi phí tăng theo bình phương số kênh).
 - Top-down: upsample (nearest x2) + add.
 - Bottom-up: downsample conv3x3 stride2 + add.
 - Mỗi P-level qua thêm 1 conv3x3 để làm mượt (smooth conv).
@@ -79,20 +82,22 @@ Output: **P3 (stride 8), P4 (stride 16), P5 (stride 32)** — mỗi cái `fpn_ch
 
 Theo đúng tinh thần SCRFD: **stacked conv head dùng chung (shared) giữa các level**, chỉ có scale factor riêng cho bbox regression mỗi level (learnable scalar, giống FCOS).
 
+> **Cập nhật (sau khi đo FLOPs thực tế):** `stacked_convs=2` ban đầu khiến head chiếm tới **73% tổng compute** (1.93/2.65 GMacs) — vì mỗi conv3x3 64→64 áp trên P3 (80x80) lặp lại 2 lần cho CẢ 3 nhánh (cls/bbox/kps) riêng biệt. Đã giảm xuống `stacked_convs=1` + `fpn_channels=32` (mặc định mới) để cân bằng lại ngân sách FLOPs với backbone.
+
 ### Cấu trúc mỗi nhánh (áp dụng độc lập trên P3/P4/P5, cùng bộ trọng số)
 
 ```
-Input Pk (fpn_channels)
+Input Pk (fpn_channels=32)
    │
-   ├─ Cls stem: [Conv3x3 + GN + ReLU] x 2  → Conv3x3 → 1 kênh (objectness biển số, sigmoid)
+   ├─ Cls stem: [Conv3x3 + GN + ReLU] x 1  → Conv3x3 → num_classes kênh (sigmoid)
    │
-   ├─ Bbox stem: [Conv3x3 + GN + ReLU] x 2  → Conv3x3 → 4 kênh (l, t, r, b), nhân scale[k] học được, sau đó x stride[k]
+   ├─ Bbox stem: [Conv3x3 + GN + ReLU] x 1  → Conv3x3 → 4 kênh (l, t, r, b), nhân scale[k] học được, sau đó x stride[k]
    │
-   └─ Kps stem: [Conv3x3 + GN + ReLU] x 2   → Conv3x3 → 8 kênh (dx1,dy1,dx2,dy2,dx3,dy3,dx4,dy4)
+   └─ Kps stem: [Conv3x3 + GN + ReLU] x 1   → Conv3x3 → 8 kênh (dx1,dy1,dx2,dy2,dx3,dy3,dx4,dy4)
                                                  nhân scale_kps[k] học được, sau đó x stride[k]
 ```
 
-- **Cls stem** và **Bbox stem** có thể share 2 conv đầu (giảm tham số), tách nhánh ở conv cuối — tuỳ ngân sách tham số. Kps stem tách riêng hoàn toàn vì task khác biệt (regression điểm, không phải cạnh box).
+- `stacked_convs` cấu hình được qua `SCRFDHead(stacked_convs=...)` — tăng lên 2 nếu cần thêm khả năng biểu diễn và chấp nhận đánh đổi FLOPs (đã đo: mỗi +1 stacked_conv ở fpn_channels=32 cộng thêm ~0.2 GMacs).
 - GN (GroupNorm) thay vì BN trong head — chuẩn thực hành để ổn định khi batch nhỏ lúc fine-tune.
 
 ### Số kênh output mỗi level (tại 1 vị trí anchor point)
@@ -140,7 +145,9 @@ Tổng loss:
 ```
 L = λ_cls * L_cls + λ_bbox * L_bbox + λ_kps * L_kps
 ```
-Khuyến nghị khởi điểm: `λ_cls=1.0, λ_bbox=1.0, λ_kps=0.5` (giảm dần theo epoch nếu keypoint dataset ít hơn bbox dataset).
+Mặc định: `λ_cls=1.0, λ_bbox=1.0, λ_kps=2.0` (cấu hình qua `--lambda-cls/--lambda-bbox/--lambda-kps` trong `train.py`).
+
+> **Cập nhật (sau khi quan sát training thật):** bản đầu dùng `λ_kps=0.5` — checkpoint 12 epoch đạt mAP@0.5=0.85 (box tốt) nhưng `kps_nme=0.13` (keypoint vẽ ra lệch rõ so với góc biển thật). mAP@0.5 chỉ đo IoU box, không phản ánh gì về keypoint, nên nhánh box có thể "báo cáo tốt" trong khi nhánh keypoint vẫn chưa hội tụ. Tăng `λ_kps` lên 2.0 (gấp 4 lần) để ép gradient nhánh keypoint mạnh hơn, tương xứng với việc regression 4 điểm góc vốn là bài toán khó hơn (nhạy với nhiễu/xoay) so với chỉ regress 4 khoảng cách cạnh box.
 
 ## 8. Input / Output tensor shape (ví dụ input 640x640)
 

@@ -52,7 +52,12 @@ class InvertedResidual(nn.Module):
 class MBFBackbone(nn.Module):
     """MobileFaceNet-style backbone, cắt bỏ GDConv/embedding, xuất C3/C4/C5.
 
-    width_mult: 0.5 cho bản edge/NPU nhẹ, 1.0 cho bản chuẩn.
+    Ngân sách nhắm ~0.5-1 GFLOPs @640x640 (tinh thần "500M-class" của SCRFD_500MF
+    gốc) — downsample nhanh ngay từ đầu (stem+dw_stem đã đạt stride 4 trước khi
+    vào block nào), số block/channel/expand-ratio tối giản so với bản đầu (bản
+    đầu có 24 block, downsample chậm -> 16.7 GFLOPs, nặng hơn SCRFD_500M ~33 lần).
+
+    width_mult: 0.5 cho bản edge/NPU nhẹ hơn nữa, 1.0 cho bản mặc định.
     """
 
     def __init__(self, width_mult: float = 1.0):
@@ -61,15 +66,14 @@ class MBFBackbone(nn.Module):
         def c(ch):
             return max(8, int(round(ch * width_mult / 8) * 8))
 
-        self.stem = conv_bn_prelu(3, c(32), kernel=3, stride=2)
-        self.dw_stem = conv_bn_prelu(c(32), c(32), kernel=3, stride=1, groups=c(32))
+        self.stem = conv_bn_prelu(3, c(16), kernel=3, stride=2)          # -> stride 2
+        self.dw_stem = conv_bn_prelu(c(16), c(16), kernel=3, stride=2, groups=c(16))  # -> stride 4
 
-        self.stage1 = self._make_stage(c(32), c(64), stride=2, expand=2, n=4)   # -> stride 4
-        self.stage2 = self._make_stage(c(64), c(64), stride=2, expand=4, n=6)   # -> stride 8  (C3)
-        self.stage3 = self._make_stage(c(64), c(128), stride=2, expand=4, n=8)  # -> stride 16 (C4)
-        self.stage4 = self._make_stage(c(128), c(128), stride=2, expand=4, n=6) # -> stride 32 (C5)
+        self.stage1 = self._make_stage(c(16), c(32), stride=2, expand=2, n=2)  # -> stride 8  (C3)
+        self.stage2 = self._make_stage(c(32), c(64), stride=2, expand=2, n=3)  # -> stride 16 (C4)
+        self.stage3 = self._make_stage(c(64), c(64), stride=2, expand=4, n=2)  # -> stride 32 (C5)
 
-        self.out_channels = (c(64), c(128), c(128))
+        self.out_channels = (c(32), c(64), c(64))
         self._init_weights()
 
     @staticmethod
@@ -90,10 +94,9 @@ class MBFBackbone(nn.Module):
     def forward(self, x):
         x = self.stem(x)
         x = self.dw_stem(x)
-        x = self.stage1(x)
-        c3 = self.stage2(x)
-        c4 = self.stage3(c3)
-        c5 = self.stage4(c4)
+        c3 = self.stage1(x)
+        c4 = self.stage2(c3)
+        c5 = self.stage3(c4)
         return c3, c4, c5
 
 
@@ -150,7 +153,7 @@ class ScaleExp(nn.Module):
 class SCRFDHead(nn.Module):
     """Head anchor-free dùng chung trọng số giữa các level P3/P4/P5."""
 
-    def __init__(self, in_channels: int = 64, stacked_convs: int = 2, num_groups: int = 8,
+    def __init__(self, in_channels: int = 32, stacked_convs: int = 1, num_groups: int = 8,
                  num_classes: int = 2):
         super().__init__()
         self.num_classes = num_classes
@@ -213,7 +216,7 @@ class SCRFDHead(nn.Module):
 class SCRFD_MBF(nn.Module):
     """Model tổng hợp: MBF backbone -> PAFPN -> SCRFD head (4 keypoint góc biển số)."""
 
-    def __init__(self, width_mult: float = 1.0, fpn_channels: int = 64, num_classes: int = 2):
+    def __init__(self, width_mult: float = 1.0, fpn_channels: int = 32, num_classes: int = 2):
         super().__init__()
         self.backbone = MBFBackbone(width_mult=width_mult)
         self.neck = PAFPN(self.backbone.out_channels, out_channels=fpn_channels)
@@ -303,7 +306,7 @@ def sort_corners(kps: torch.Tensor) -> torch.Tensor:
 
 
 if __name__ == "__main__":
-    model = SCRFD_MBF(width_mult=1.0, fpn_channels=64, num_classes=2)
+    model = SCRFD_MBF(width_mult=1.0, fpn_channels=32, num_classes=2)
     dummy = torch.randn(1, 3, 640, 640)
     outs = model(dummy)
     for i, (cls_s, bbox_d, kps_o) in enumerate(outs):

@@ -69,7 +69,7 @@ def bbox_diou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) 
 
 class SCRFDLoss(nn.Module):
     def __init__(self, img_size: int = 640, num_classes: int = 2,
-                 lambda_cls: float = 1.0, lambda_bbox: float = 1.0, lambda_kps: float = 0.5,
+                 lambda_cls: float = 1.0, lambda_bbox: float = 1.0, lambda_kps: float = 2.0,
                  topk: int = 9, anchor_scale: float = 8.0):
         super().__init__()
         self.img_size = img_size

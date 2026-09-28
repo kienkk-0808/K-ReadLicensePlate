@@ -4,10 +4,19 @@ Ví dụ chạy:
     python train.py --data-root dataset --epochs 50 --batch-size 8 --img-size 640
 
 Chiến lược "elitist" (mặc định bật, tắt bằng --no-elitist):
-    Sau mỗi epoch, đánh giá mAP@0.5 thật (models/metrics.py, có NMS + IoU-matching,
-    không chỉ dựa vào loss) trên tập valid.
-    - Nếu mAP@0.5 CAO HƠN best hiện tại -> lưu làm best.pt, tiếp tục train bình thường
-      từ trọng số hiện tại (đang là best).
+    Sau mỗi epoch, đánh giá mAP@0.5 + kps_nme thật (models/metrics.py, có NMS +
+    IoU-matching, không chỉ dựa vào loss) trên tập valid.
+
+    mAP@0.5 CHỈ đo độ chính xác box (IoU>=0.5 + đúng class) — hoàn toàn không nhìn
+    vào keypoint. Nếu chỉ dùng mAP50 để chọn best, 1 epoch có box tốt nhưng nhánh
+    keypoint chưa hội tụ (kps_nme cao) vẫn có thể được phong "best" — không phải lỗi
+    lý thuyết, đã quan sát thực tế: checkpoint mAP50=0.85 nhưng vẽ ra 4 góc bị lệch
+    hẳn so với biển số thật. Vì vậy dùng composite_score để chọn best:
+
+        composite_score = mAP50 - kps_weight * min(kps_nme, 1.0)   (--kps-weight, mặc định 0.5)
+
+    - Nếu composite_score CAO HƠN best hiện tại -> lưu làm best.pt, tiếp tục train
+      bình thường từ trọng số hiện tại (đang là best).
     - Nếu KHÔNG cải thiện -> nạp lại trọng số + optimizer state từ best.pt trước khi
       bắt đầu epoch kế tiếp ("lấy best ra train tiếp"), tránh việc 1 epoch tệ (do
       augmentation ngẫu nhiên xấu, LR nhảy...) kéo lùi cả quá trình học trên tập dữ
@@ -40,7 +49,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--width-mult", type=float, default=1.0)
-    p.add_argument("--fpn-channels", type=int, default=64)
+    p.add_argument("--fpn-channels", type=int, default=32)
     p.add_argument("--num-classes", type=int, default=2)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -53,6 +62,14 @@ def parse_args():
                     help="Tắt chiến lược revert-to-best sau mỗi epoch không cải thiện")
     p.add_argument("--map-iou", type=float, default=0.5, help="Ngưỡng IoU dùng để tính mAP")
     p.add_argument("--nms-iou", type=float, default=0.5, help="Ngưỡng IoU dùng để NMS lúc eval")
+    p.add_argument("--kps-weight", type=float, default=0.5,
+                    help="Trọng số phạt kps_nme khi chọn best checkpoint: "
+                         "composite = mAP50 - kps_weight * min(kps_nme, 1.0)")
+    p.add_argument("--lambda-cls", type=float, default=1.0, help="Trọng số cls_loss trong tổng loss")
+    p.add_argument("--lambda-bbox", type=float, default=1.0, help="Trọng số bbox_loss trong tổng loss")
+    p.add_argument("--lambda-kps", type=float, default=2.0,
+                    help="Trọng số kps_loss trong tổng loss — tăng lên nếu keypoint hội tụ "
+                         "chậm hơn box (quan sát thực tế: mAP cao nhưng kps_nme vẫn cao)")
     return p.parse_args()
 
 
@@ -110,7 +127,10 @@ def main():
         num_classes=args.num_classes,
     ).to(device)
 
-    loss_fn = SCRFDLoss(img_size=args.img_size, num_classes=args.num_classes).to(device)
+    loss_fn = SCRFDLoss(
+        img_size=args.img_size, num_classes=args.num_classes,
+        lambda_cls=args.lambda_cls, lambda_bbox=args.lambda_bbox, lambda_kps=args.lambda_kps,
+    ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -171,10 +191,18 @@ def main():
                 model, val_loader, device,
                 nms_iou=args.nms_iou, map_iou=args.map_iou, num_classes=args.num_classes,
             )
+            # mAP50 chỉ đo box (IoU>=map_iou + đúng class) -> KHÔNG phản ánh độ chính
+            # xác keypoint. Dùng composite_score để chọn best, tránh trường hợp 1 epoch
+            # có box tốt nhưng keypoint tệ (kps_nme cao) vẫn được phong "best".
+            kps_nme = det_metrics["kps_nme"]
+            kps_penalty = 1.0 if kps_nme == float("inf") else min(kps_nme, 1.0)
+            composite_score = det_metrics["mAP50"] - args.kps_weight * kps_penalty
+            det_metrics["composite_score"] = composite_score
+
             print(
                 f"[epoch {epoch}] VAL loss={val_loss_metrics['loss']:.4f} "
                 f"| mAP@{args.map_iou:.2f}={det_metrics['mAP50']:.4f} "
-                f"kps_nme={det_metrics['kps_nme']:.4f}"
+                f"kps_nme={kps_nme:.4f} composite={composite_score:.4f}"
             )
 
             last_ckpt = {
@@ -189,21 +217,24 @@ def main():
             }
             torch.save(last_ckpt, output_dir / "last.pt")
 
-            if det_metrics["mAP50"] > best_map:
-                best_map = det_metrics["mAP50"]
+            if composite_score > best_map:
+                best_map = composite_score
                 last_ckpt["best_map"] = best_map
                 torch.save(last_ckpt, output_dir / "best.pt")
-                print(f"[epoch {epoch}] best model moi, mAP@{args.map_iou:.2f}={best_map:.4f}")
+                print(
+                    f"[epoch {epoch}] best model moi, composite={best_map:.4f} "
+                    f"(mAP@{args.map_iou:.2f}={det_metrics['mAP50']:.4f}, kps_nme={kps_nme:.4f})"
+                )
             elif not args.no_elitist:
-                # Epoch này không cải thiện mAP -> nạp lại trọng số + optimizer từ
-                # best.pt trước khi bước sang epoch kế tiếp ("lấy best ra train tiếp").
+                # Epoch này không cải thiện composite_score -> nạp lại trọng số + optimizer
+                # từ best.pt trước khi bước sang epoch kế tiếp ("lấy best ra train tiếp").
                 best_path = output_dir / "best.pt"
                 if best_path.exists():
                     best_ckpt = torch.load(best_path, map_location=device)
                     model.load_state_dict(best_ckpt["model"])
                     optimizer.load_state_dict(best_ckpt["optimizer"])
                     print(
-                        f"[epoch {epoch}] khong cai thien (mAP={det_metrics['mAP50']:.4f} "
+                        f"[epoch {epoch}] khong cai thien (composite={composite_score:.4f} "
                         f"<= best={best_map:.4f}) -> nap lai trong so best.pt cho epoch sau"
                     )
 
