@@ -1,0 +1,148 @@
+"""Augmentation cho ảnh biển số (áp dụng trên ảnh gốc, TRƯỚC bước letterbox).
+
+Toàn bộ transform hình học (flip, affine) tác động đồng thời lên box và 4 keypoint
+góc bằng cùng 1 ma trận biến đổi — không cần map lại "góc nào là góc nào" theo
+flip_idx của Roboflow, vì thứ tự góc luôn được chuẩn hoá lại bằng sort_corners()
+(models/scrfd_mbf.py) ngay sau khi letterbox, dựa trên toạ độ hình học cuối cùng.
+"""
+
+import random
+from typing import Tuple
+
+import cv2
+import numpy as np
+
+
+def augment_hsv(img: np.ndarray, hgain: float = 0.015, sgain: float = 0.7,
+                 vgain: float = 0.4) -> np.ndarray:
+    """Jitter màu theo không gian HSV (chuẩn thực hành YOLOv5). img: RGB uint8."""
+    if not (hgain or sgain or vgain):
+        return img
+    r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1
+    hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_RGB2HSV))
+    dtype = img.dtype
+
+    x = np.arange(0, 256, dtype=np.int16)
+    lut_hue = ((x * r[0]) % 180).astype(dtype)
+    lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
+    lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+
+    img_hsv = cv2.merge((
+        cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)
+    ))
+    return cv2.cvtColor(img_hsv, cv2.COLOR_HSV2RGB)
+
+
+def random_flip_lr(img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
+                    p: float = 0.5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if random.random() >= p:
+        return img, boxes, kps
+
+    w = img.shape[1]
+    img = np.ascontiguousarray(img[:, ::-1])
+
+    if boxes.shape[0]:
+        x1 = boxes[:, 0].copy()
+        boxes[:, 0] = w - boxes[:, 2]
+        boxes[:, 2] = w - x1
+    if kps.shape[0]:
+        kps = kps.copy()
+        kps[..., 0] = w - kps[..., 0]
+    return img, boxes, kps
+
+
+def _transform_points(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """pts: (..., 2), M: (3,3) affine matrix -> (..., 2) sau biến đổi."""
+    shape = pts.shape
+    flat = pts.reshape(-1, 2).astype(np.float32)
+    ones = np.ones((flat.shape[0], 1), dtype=np.float32)
+    homo = np.concatenate([flat, ones], axis=1)
+    out = (M @ homo.T).T[:, :2]
+    return out.reshape(shape)
+
+
+def random_affine(
+    img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
+    degrees: float = 10.0, scale: Tuple[float, float] = (0.75, 1.25),
+    translate: float = 0.10, border_value=(114, 114, 114),
+    min_area_ratio: float = 0.4, min_size: float = 4.0,
+):
+    """Xoay nhẹ + scale + dịch chuyển ngẫu nhiên, giữ nguyên kích thước canvas gốc.
+
+    Trả về: img mới, boxes mới (đã clip vào canvas), kps mới, keep_mask (N,) bool
+    — object nào bị cắt mất phần lớn (do xoay/dịch ra khỏi khung) sẽ bị loại.
+    """
+    h, w = img.shape[:2]
+
+    center = np.eye(3, dtype=np.float32)
+    center[0, 2] = -w / 2
+    center[1, 2] = -h / 2
+
+    angle = random.uniform(-degrees, degrees)
+    scale_f = random.uniform(*scale)
+    R = np.eye(3, dtype=np.float32)
+    R[:2] = cv2.getRotationMatrix2D(angle=angle, center=(0, 0), scale=scale_f)
+
+    T = np.eye(3, dtype=np.float32)
+    T[0, 2] = random.uniform(-translate, translate) * w
+    T[1, 2] = random.uniform(-translate, translate) * h
+
+    back = np.eye(3, dtype=np.float32)
+    back[0, 2] = w / 2
+    back[1, 2] = h / 2
+
+    M = back @ T @ R @ center
+
+    img_out = cv2.warpAffine(img, M[:2], dsize=(w, h), borderValue=border_value)
+
+    n = boxes.shape[0]
+    if n == 0:
+        return img_out, boxes, kps, np.ones((0,), dtype=bool)
+
+    corners = np.zeros((n, 4, 2), dtype=np.float32)
+    corners[:, 0] = boxes[:, [0, 1]]
+    corners[:, 1] = boxes[:, [2, 1]]
+    corners[:, 2] = boxes[:, [2, 3]]
+    corners[:, 3] = boxes[:, [0, 3]]
+
+    corners_t = _transform_points(corners, M)
+    new_boxes = np.concatenate([corners_t.min(axis=1), corners_t.max(axis=1)], axis=1)
+
+    kps_t = _transform_points(kps, M) if kps.shape[0] else kps
+
+    new_boxes[:, [0, 2]] = new_boxes[:, [0, 2]].clip(0, w)
+    new_boxes[:, [1, 3]] = new_boxes[:, [1, 3]].clip(0, h)
+
+    orig_area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    new_w = new_boxes[:, 2] - new_boxes[:, 0]
+    new_h = new_boxes[:, 3] - new_boxes[:, 1]
+    new_area = new_w * new_h
+
+    keep = (
+        (new_area / (orig_area + 1e-6) > min_area_ratio)
+        & (new_w > min_size) & (new_h > min_size)
+    )
+    return img_out, new_boxes, kps_t, keep
+
+
+def train_augment(
+    img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
+    flip_p: float = 0.5, degrees: float = 10.0, scale: Tuple[float, float] = (0.75, 1.25),
+    translate: float = 0.10, hsv: Tuple[float, float, float] = (0.015, 0.7, 0.4),
+):
+    """Pipeline augment đầy đủ cho 1 ảnh (áp dụng cho train split).
+
+    boxes: (N,4) xyxy pixel | kps: (N,4,2) pixel — cùng hệ toạ độ ảnh gốc.
+    Trả về img, boxes, kps đã lọc theo keep_mask, và keep_mask để caller lọc labels.
+    """
+    img, boxes, kps = random_flip_lr(img, boxes, kps, p=flip_p)
+    img, boxes, kps, keep = random_affine(
+        img, boxes, kps, degrees=degrees, scale=scale, translate=translate,
+    )
+    img = augment_hsv(img, *hsv)
+
+    if boxes.shape[0]:
+        boxes = boxes[keep]
+        kps = kps[keep]
+
+    return img, boxes, kps, keep
