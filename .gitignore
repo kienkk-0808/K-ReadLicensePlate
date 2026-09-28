@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.Python
+build/
+dist/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Training artifacts (checkpoint, log)
+runs/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Dataset (lớn, không commit vào git — quản lý riêng qua Roboflow/DVC/LFS nếu cần)
+dataset/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
