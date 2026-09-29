@@ -1,6 +1,4 @@
-"""Tiện ích dùng chung giữa model, assigner và loss: sinh anchor point theo lưới
-và "làm phẳng" (flatten) output đa cấp (P3/P4/P5) về 1 tensor duy nhất mỗi ảnh.
-"""
+"""Anchor points + flatten/decode dùng chung giữa model, assigner và loss."""
 
 from typing import List, Tuple
 
@@ -10,14 +8,7 @@ from models.scrfd_mbf import STRIDES, NUM_KPS
 
 
 def generate_points(img_size: int, strides: Tuple[int, ...] = STRIDES, device=None):
-    """Sinh toạ độ tâm anchor point cho toàn bộ level, theo đúng công thức decode()
-    trong models/scrfd_mbf.py: px = (j+0.5)*stride, py = (i+0.5)*stride.
-
-    Trả về:
-        points: (total_points, 2) — toạ độ (px, py) pixel trong ảnh img_size x img_size
-        strides_per_point: (total_points,) — stride tương ứng của từng điểm
-        num_points_per_level: List[int]
-    """
+    """-> points(total,2), strides_per_point(total,), num_points_per_level."""
     all_points = []
     all_strides = []
     num_points_per_level = []
@@ -31,7 +22,7 @@ def generate_points(img_size: int, strides: Tuple[int, ...] = STRIDES, device=No
         )
         px = (xv.reshape(-1).float() + 0.5) * stride
         py = (yv.reshape(-1).float() + 0.5) * stride
-        pts = torch.stack([px, py], dim=-1)  # (size*size, 2)
+        pts = torch.stack([px, py], dim=-1)
 
         all_points.append(pts)
         all_strides.append(torch.full((size * size,), float(stride), device=device))
@@ -43,14 +34,7 @@ def generate_points(img_size: int, strides: Tuple[int, ...] = STRIDES, device=No
 
 
 def flatten_head_outputs(outputs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
-    """outputs: list[(cls_score, bbox_dist, kps_offset)] mỗi phần tử shape (B,C,H,W),
-    theo thứ tự P3,P4,P5 (giống forward() của SCRFD_MBF).
-
-    Trả về (mỗi tensor đã gộp theo thứ tự level P3->P4->P5, giống generate_points):
-        cls_logits: (B, total_points, num_classes)
-        bbox_dist:  (B, total_points, 4)
-        kps_offset: (B, total_points, NUM_KPS*2)
-    """
+    """list[(cls,bbox,kps) per level, (B,C,H,W)] -> (cls_logits, bbox_dist, kps_offset) gộp (B,N,C)."""
     cls_list, bbox_list, kps_list = [], [], []
     for cls_score, bbox_dist, kps_offset in outputs:
         b, num_classes, h, w = cls_score.shape
@@ -65,11 +49,7 @@ def flatten_head_outputs(outputs: List[Tuple[torch.Tensor, torch.Tensor, torch.T
 
 
 def decode_points(points: torch.Tensor, bbox_dist: torch.Tensor, kps_offset: torch.Tensor):
-    """Decode (l,t,r,b) và (dx,dy)x4 tại từng điểm -> box xyxy + kps tuyệt đối.
-
-    points: (N, 2) | bbox_dist: (..., N, 4) | kps_offset: (..., N, NUM_KPS*2)
-    Hỗ trợ broadcast theo batch (bbox_dist/kps_offset có thêm chiều batch ở đầu).
-    """
+    """points(N,2) + bbox_dist/kps_offset(...,N,*) -> boxes xyxy, kps tuyệt đối."""
     px, py = points[..., 0], points[..., 1]
 
     x1 = px - bbox_dist[..., 0]

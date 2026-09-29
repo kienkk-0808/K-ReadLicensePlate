@@ -1,29 +1,8 @@
-"""
-Dataset loader cho dữ liệu biển số định dạng YOLO-Pose (Roboflow export),
-dùng để train SCRFD_MBF (models/scrfd_mbf.py).
+"""Dataset loader YOLO-Pose (Roboflow) cho SCRFD_MBF.
 
-Format label (mỗi dòng .txt, giống dataset/data.yaml):
-    class cx cy w h  x1 y1 v1  x2 y2 v2  x3 y3 v3  x4 y4 v4
-    - class, cx, cy, w, h: normalized theo (W, H) của ảnh gốc (chuẩn YOLO)
-    - (xi, yi): toạ độ keypoint thứ i, normalized theo (W, H)
-    - vi: visibility flag (0=không có, 1=che khuất, 2=nhìn thấy rõ) — dataset hiện tại luôn = 2
-
-    kpt_shape: [4, 3] -> 4 keypoint, mỗi keypoint 3 giá trị (x, y, v)
-    Thứ tự 4 keypoint theo Roboflow export KHÔNG đảm bảo là TL/TR/BR/BL cố định —
-    dataset này cần được coi là "4 góc không thứ tự chuẩn", nên trước khi dùng làm
-    target train, ta sắp xếp lại bằng sort_corners() (models/scrfd_mbf.py) để ép
-    về thứ tự nhất quán TL->TR->BR->BL, tránh mô hình học nhầm hoán vị góc.
-
-Dataset gốc có nc=2 ('plate-1-line', 'plate-2-line'), nhưng loader này GỘP về 1 class
-duy nhất ("plate") — bài toán thực tế chỉ cần bbox + 4 keypoint để crop/warp biển số
-đưa qua OCR, không cần phân biệt 1 dòng/2 dòng ở bước detect (việc đó OCR/logic sau
-tự suy ra từ hình dạng box), nên bỏ phân loại 2 lớp để giảm tải cho nhánh cls, tối ưu
-model (nhẹ hơn, hội tụ nhanh hơn vì không phải học ranh giới 2 class dễ nhầm lẫn).
-
-Pipeline xử lý 1 ảnh (split="train", augment=True):
-    đọc ảnh + label (pixel gốc) -> augment hình học (flip/affine) + màu (hsv)
-    -> letterbox về (img_size, img_size) -> chuẩn hoá thứ tự 4 góc (sort_corners)
-Với split="valid"/"test" hoặc augment=False: bỏ qua bước augment, chỉ letterbox.
+Format label: class cx cy w h  x1 y1 v1 x2 y2 v2 x3 y3 v3 x4 y4 v4 (normalized).
+Thứ tự 4 keypoint không cố định TL/TR/BR/BL -> chuẩn hoá bằng sort_corners().
+Gộp mọi class gốc (plate-1-line/plate-2-line) về 1 class "plate".
 """
 
 import os
@@ -44,10 +23,7 @@ CLASS_NAMES = ["plate"]
 
 
 def letterbox(img: np.ndarray, new_size: int = 640, pad_value: int = 114):
-    """Resize giữ tỉ lệ + pad về hình vuông (new_size x new_size).
-
-    Trả về: img đã resize/pad, scale, (pad_x, pad_y)
-    """
+    """-> canvas vuông (new_size), scale, (pad_x, pad_y)."""
     h, w = img.shape[:2]
     scale = min(new_size / h, new_size / w)
     new_h, new_w = int(round(h * scale)), int(round(w * scale))
@@ -61,9 +37,7 @@ def letterbox(img: np.ndarray, new_size: int = 640, pad_value: int = 114):
 
 
 def parse_label_file(label_path: Path, num_kps: int = NUM_KPS) -> List[dict]:
-    """Đọc 1 file .txt YOLO-pose -> list object, mỗi object gồm:
-    {class_id, cx, cy, w, h, kps: [(x, y, v), ...]}  (tất cả normalized 0-1)
-    """
+    """-> list[{class_id, cx, cy, w, h, kps: [(x,y,v), ...]}] (normalized 0-1)."""
     objects = []
     if not label_path.exists():
         return objects
@@ -91,12 +65,6 @@ class LicensePlateYoloPoseDataset(Dataset):
     def __init__(self, root: str, split: str = "train", img_size: int = 640,
                  num_kps: int = NUM_KPS, augment: bool = None,
                  augment_hyp: dict = None):
-        """
-        root: thư mục gốc chứa data.yaml (vd: "dataset")
-        split: "train" | "valid" | "test"
-        augment: None -> tự bật khi split=="train", tắt khi khác. Có thể ép rõ True/False.
-        augment_hyp: override hyperparameter augment, xem datasets/augmentations.py:train_augment
-        """
         self.root = Path(root)
         self.img_dir = self.root / split / "images"
         self.label_dir = self.root / split / "labels"
@@ -134,13 +102,12 @@ class LicensePlateYoloPoseDataset(Dataset):
             boxes = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
             boxes = boxes.astype(np.float32)
 
-            # Gộp toàn bộ về class 0 ("plate") — xem ghi chú đầu file.
             labels = np.zeros(num_obj, dtype=np.int64)
 
             kps = np.array([
                 [(kx * orig_w, ky * orig_h) for (kx, ky, kv) in o["kps"]]
                 for o in objects
-            ], dtype=np.float32)  # (N, 4, 2)
+            ], dtype=np.float32)
         else:
             boxes = np.zeros((0, 4), dtype=np.float32)
             labels = np.zeros((0,), dtype=np.int64)
@@ -167,18 +134,16 @@ class LicensePlateYoloPoseDataset(Dataset):
         if boxes.shape[0]:
             boxes_t = torch.from_numpy(boxes)
             labels_t = torch.from_numpy(labels)
-            kps_t = torch.from_numpy(kps)
-            # ép thứ tự 4 góc về 1 trật tự nhất quán (vd TL->TR->BR->BL), vector hoá toàn bộ N object
-            kps_t = sort_corners(kps_t)
+            kps_t = sort_corners(torch.from_numpy(kps))
         else:
             boxes_t = torch.zeros((0, 4), dtype=torch.float32)
             labels_t = torch.zeros((0,), dtype=torch.long)
             kps_t = torch.zeros((0, self.num_kps, 2), dtype=torch.float32)
 
         target = {
-            "boxes": boxes_t,    # (N, 4) x1,y1,x2,y2 theo pixel ảnh đã letterbox (img_size x img_size)
-            "labels": labels_t,  # (N,)
-            "kps": kps_t,        # (N, 4, 2) theo pixel ảnh đã letterbox
+            "boxes": boxes_t,
+            "labels": labels_t,
+            "kps": kps_t,
             "img_size": self.img_size,
             "orig_size": (orig_w, orig_h),
             "scale": scale,

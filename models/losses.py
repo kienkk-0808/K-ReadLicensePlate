@@ -1,15 +1,5 @@
-"""Loss cho SCRFD_MBF:
-- Cls: Sigmoid Focal Loss (hard label 0/1), giống RetinaNet/ATSS/SCRFD gốc.
-- Bbox: DIoU Loss, chỉ tính tại vị trí positive.
-- Kps: Smooth-L1, chuẩn hoá theo đường chéo box GT, chỉ tính tại vị trí positive.
-
-Ghi chú so với docs/architecture/SCRFD-MBF-LP-4KPS.md: doc mô tả phương án dùng
-Quality Focal Loss (soft target = IoU) cho nhánh cls. Ở bản implement này dùng
-Focal Loss với target cứng (0/1) để đơn giản hoá vòng lặp train (không cần decode
-pred box ngay trong loss để tính IoU động mỗi step) — đây là lựa chọn tiêu chuẩn
-của SCRFD/ATSS gốc (mmdetection ATSSHead mặc định dùng FocalLoss), vẫn đúng tinh
-thần thiết kế, chỉ khác ở việc soft/hard target.
-"""
+"""Loss cho SCRFD_MBF: cls = Sigmoid Focal Loss, bbox = DIoU, kps = Smooth-L1
+(chuẩn hoá theo đường chéo box GT) — chỉ tính tại vị trí positive (gán bởi ATSS)."""
 
 from typing import Dict, List
 
@@ -87,12 +77,10 @@ class SCRFDLoss(nn.Module):
 
     def forward(self, outputs, targets: List[Dict]) -> Dict[str, torch.Tensor]:
         cls_logits, bbox_dist, kps_offset = flatten_head_outputs(outputs)
-        # (B, N, num_classes), (B, N, 4), (B, N, 8)
         batch_size = cls_logits.shape[0]
         device = cls_logits.device
 
         pred_boxes, pred_kps = decode_points(self.points, bbox_dist, kps_offset)
-        # pred_boxes: (B, N, 4) | pred_kps: (B, N, 4, 2)
 
         total_cls_loss = cls_logits.new_zeros(())
         total_bbox_loss = cls_logits.new_zeros(())
@@ -128,7 +116,7 @@ class SCRFDLoss(nn.Module):
                         (matched_boxes[:, 2] - matched_boxes[:, 0]).pow(2)
                         + (matched_boxes[:, 3] - matched_boxes[:, 1]).pow(2)
                     ).clamp(min=1.0)
-                    pred_kps_pos = pred_kps[i][pos_mask]  # (num_pos, 4, 2)
+                    pred_kps_pos = pred_kps[i][pos_mask]
                     kps_diff = (pred_kps_pos - matched_kps) / diag.view(-1, 1, 1)
                     kps_loss = F.smooth_l1_loss(
                         kps_diff, torch.zeros_like(kps_diff), reduction="sum"

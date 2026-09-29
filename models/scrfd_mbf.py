@@ -1,6 +1,4 @@
-"""
-SCRFD-MBF: SCRFD detector với backbone MobileFaceNet-style (MBF), đầu ra 4 keypoint
-góc biển số (thay vì 5 keypoint khuôn mặt của SCRFD gốc).
+"""SCRFD-MBF: backbone MobileFaceNet-style + head 4 keypoint góc biển số.
 
 Kiến trúc: xem docs/architecture/SCRFD-MBF-LP-4KPS.md
 """
@@ -12,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-NUM_KPS = 4  # 4 góc biển số: top-left, top-right, bottom-right, bottom-left
+NUM_KPS = 4
 STRIDES = (8, 16, 32)
 
 
@@ -26,8 +24,6 @@ def conv_bn_prelu(in_c, out_c, kernel=3, stride=1, groups=1):
 
 
 class InvertedResidual(nn.Module):
-    """Bottleneck MobileNetV2-style dùng PReLU (đặc trưng MobileFaceNet)."""
-
     def __init__(self, in_c, out_c, stride, expand_ratio):
         super().__init__()
         assert stride in (1, 2)
@@ -50,28 +46,18 @@ class InvertedResidual(nn.Module):
 
 
 class MBFBackbone(nn.Module):
-    """MobileFaceNet-style backbone, cắt bỏ GDConv/embedding, xuất C3/C4/C5.
-
-    Ngân sách nhắm ~0.5-1 GFLOPs @640x640 (tinh thần "500M-class" của SCRFD_500MF
-    gốc) — downsample nhanh ngay từ đầu (stem+dw_stem đã đạt stride 4 trước khi
-    vào block nào), số block/channel/expand-ratio tối giản so với bản đầu (bản
-    đầu có 24 block, downsample chậm -> 16.7 GFLOPs, nặng hơn SCRFD_500M ~33 lần).
-
-    width_mult: 0.5 cho bản edge/NPU nhẹ hơn nữa, 1.0 cho bản mặc định.
-    """
-
     def __init__(self, width_mult: float = 1.0):
         super().__init__()
 
         def c(ch):
             return max(8, int(round(ch * width_mult / 8) * 8))
 
-        self.stem = conv_bn_prelu(3, c(16), kernel=3, stride=2)          # -> stride 2
-        self.dw_stem = conv_bn_prelu(c(16), c(16), kernel=3, stride=2, groups=c(16))  # -> stride 4
+        self.stem = conv_bn_prelu(3, c(16), kernel=3, stride=2)
+        self.dw_stem = conv_bn_prelu(c(16), c(16), kernel=3, stride=2, groups=c(16))
 
-        self.stage1 = self._make_stage(c(16), c(32), stride=2, expand=2, n=2)  # -> stride 8  (C3)
-        self.stage2 = self._make_stage(c(32), c(64), stride=2, expand=2, n=3)  # -> stride 16 (C4)
-        self.stage3 = self._make_stage(c(64), c(64), stride=2, expand=4, n=2)  # -> stride 32 (C5)
+        self.stage1 = self._make_stage(c(16), c(32), stride=2, expand=2, n=2)
+        self.stage2 = self._make_stage(c(32), c(64), stride=2, expand=2, n=3)
+        self.stage3 = self._make_stage(c(64), c(64), stride=2, expand=4, n=2)
 
         self.out_channels = (c(32), c(64), c(64))
         self._init_weights()
@@ -101,8 +87,6 @@ class MBFBackbone(nn.Module):
 
 
 class PAFPN(nn.Module):
-    """Path Aggregation FPN: top-down + bottom-up, theo tinh thần SCRFD."""
-
     def __init__(self, in_channels: Tuple[int, int, int], out_channels: int = 64):
         super().__init__()
         self.lateral = nn.ModuleList([
@@ -124,13 +108,11 @@ class PAFPN(nn.Module):
         p4 = self.lateral[1](c4)
         p5 = self.lateral[2](c5)
 
-        # top-down
         p4 = p4 + F.interpolate(p5, size=p4.shape[-2:], mode="nearest")
         p4 = self.smooth_td[0](p4)
         p3 = p3 + F.interpolate(p4, size=p3.shape[-2:], mode="nearest")
         p3 = self.smooth_td[1](p3)
 
-        # bottom-up
         p4 = p4 + self.downsample[0](p3)
         p4 = self.smooth_bu[0](p4)
         p5 = p5 + self.downsample[1](p4)
@@ -140,8 +122,6 @@ class PAFPN(nn.Module):
 
 
 class ScaleExp(nn.Module):
-    """Learnable per-level scale, dùng cho bbox/kps regression (kiểu FCOS)."""
-
     def __init__(self, init_value: float = 1.0):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
@@ -151,8 +131,6 @@ class ScaleExp(nn.Module):
 
 
 class SCRFDHead(nn.Module):
-    """Head anchor-free dùng chung trọng số giữa các level P3/P4/P5."""
-
     def __init__(self, in_channels: int = 32, stacked_convs: int = 1, num_groups: int = 8,
                  num_classes: int = 1):
         super().__init__()
@@ -185,37 +163,27 @@ class SCRFDHead(nn.Module):
         for m in [self.cls_pred, self.bbox_pred, self.kps_pred]:
             nn.init.normal_(m.weight, std=0.01)
             nn.init.zeros_(m.bias)
-        # bias khởi tạo cho cls để ổn định focal loss lúc đầu train (prior prob ~0.01)
         prior_prob = 0.01
-        bias_value = -math.log((1 - prior_prob) / prior_prob)
-        nn.init.constant_(self.cls_pred.bias, bias_value)
+        nn.init.constant_(self.cls_pred.bias, -math.log((1 - prior_prob) / prior_prob))
 
     def forward_single(self, feat, level_idx: int):
         stride = STRIDES[level_idx]
 
-        cls_feat = self.cls_stem(feat)
-        cls_score = self.cls_pred(cls_feat)  # (B, 1, H, W), logit
+        cls_score = self.cls_pred(self.cls_stem(feat))
 
-        bbox_feat = self.bbox_stem(feat)
-        bbox_dist = self.bbox_pred(bbox_feat)  # (B, 4, H, W) -> (l, t, r, b)
+        bbox_dist = self.bbox_pred(self.bbox_stem(feat))
         bbox_dist = F.relu(self.bbox_scales[level_idx](bbox_dist)) * stride
 
-        kps_feat = self.kps_stem(feat)
-        kps_offset = self.kps_pred(kps_feat)  # (B, 8, H, W)
+        kps_offset = self.kps_pred(self.kps_stem(feat))
         kps_offset = self.kps_scales[level_idx](kps_offset) * stride
 
         return cls_score, bbox_dist, kps_offset
 
     def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
-        outputs = []
-        for i, feat in enumerate(feats):
-            outputs.append(self.forward_single(feat, i))
-        return outputs  # list[(cls, bbox, kps)] theo thứ tự P3, P4, P5
+        return [self.forward_single(feat, i) for i, feat in enumerate(feats)]
 
 
 class SCRFD_MBF(nn.Module):
-    """Model tổng hợp: MBF backbone -> PAFPN -> SCRFD head (4 keypoint góc biển số)."""
-
     def __init__(self, width_mult: float = 1.0, fpn_channels: int = 32, num_classes: int = 1):
         super().__init__()
         self.backbone = MBFBackbone(width_mult=width_mult)
@@ -227,16 +195,11 @@ class SCRFD_MBF(nn.Module):
     def forward(self, x):
         feats = self.backbone(x)
         feats = self.neck(feats)
-        return self.head(feats)  # list[(cls_score, bbox_dist, kps_offset)] mỗi level
+        return self.head(feats)
 
     @torch.no_grad()
     def decode(self, outputs, score_thr: float = 0.3):
-        """Decode raw head outputs -> list[(boxes, scores, labels, kps)] theo batch.
-
-        boxes: (N, 4) x1,y1,x2,y2 | scores: (N,) | labels: (N,) class id (argmax)
-        kps: (N, 4, 2)
-        Lưu ý: chưa NMS — áp dụng NMS (vd torchvision.ops.nms, per-class) sau bước này.
-        """
+        """-> list[(boxes[N,4], scores[N], labels[N], kps[N,4,2])] theo batch. Chưa NMS."""
         batch_size = outputs[0][0].shape[0]
         results = [[] for _ in range(batch_size)]
 
@@ -245,7 +208,7 @@ class SCRFD_MBF(nn.Module):
             b, num_classes, h, w = cls_score.shape
 
             cls_prob = cls_score.sigmoid().permute(0, 2, 3, 1).reshape(b, h * w, num_classes)
-            scores, labels = cls_prob.max(dim=-1)  # (b, h*w) mỗi
+            scores, labels = cls_prob.max(dim=-1)
 
             yv, xv = torch.meshgrid(
                 torch.arange(h, device=cls_score.device),
@@ -262,7 +225,7 @@ class SCRFD_MBF(nn.Module):
             y1 = py - bbox_dist[..., 1]
             x2 = px + bbox_dist[..., 2]
             y2 = py + bbox_dist[..., 3]
-            boxes = torch.stack([x1, y1, x2, y2], dim=-1)  # (b, h*w, 4)
+            boxes = torch.stack([x1, y1, x2, y2], dim=-1)
 
             kps = kps_offset.reshape(b, h * w, NUM_KPS, 2)
             kps = kps + torch.stack([px, py], dim=-1).reshape(1, h * w, 1, 2)
@@ -291,18 +254,12 @@ class SCRFD_MBF(nn.Module):
 
 
 def sort_corners(kps: torch.Tensor) -> torch.Tensor:
-    """Sắp xếp lại 4 điểm góc theo thứ tự TL, TR, BR, BL dựa trên centroid + góc.
-
-    kps: (N, 4, 2)
-    """
-    centroid = kps.mean(dim=1, keepdim=True)  # (N, 1, 2)
+    """kps: (N,4,2) -> sắp lại theo góc quanh centroid, thứ tự cyclic nhất quán."""
+    centroid = kps.mean(dim=1, keepdim=True)
     vec = kps - centroid
-    angles = torch.atan2(vec[..., 1], vec[..., 0])  # (N, 4)
+    angles = torch.atan2(vec[..., 1], vec[..., 0])
     order = torch.argsort(angles, dim=1)
-    sorted_kps = torch.gather(
-        kps, 1, order.unsqueeze(-1).expand(-1, -1, 2)
-    )
-    return sorted_kps
+    return torch.gather(kps, 1, order.unsqueeze(-1).expand(-1, -1, 2))
 
 
 if __name__ == "__main__":

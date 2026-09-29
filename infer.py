@@ -1,14 +1,6 @@
-"""Chạy thử model (checkpoint .pt hoặc .onnx) trên 1 ảnh thật, vẽ box + 4 keypoint
-góc biển số lên ảnh gốc và lưu kết quả ra file.
+"""Chạy thử model (.pt hoặc .onnx) trên 1 ảnh, vẽ box + 4 keypoint, lưu ra file.
 
-Ví dụ chạy:
-    # Dùng checkpoint PyTorch
-    python infer.py --image dataset/valid/images/<ten_anh>.jpg \
-        --checkpoint runs/scrfd_mbf_fast/best.pt --output out.jpg
-
-    # Dùng model đã export ONNX (khuyến nghị để test đúng cái sẽ deploy)
-    python infer.py --image dataset/valid/images/<ten_anh>.jpg \
-        --onnx runs/scrfd_mbf_fast/best.onnx --output out.jpg
+Ví dụ: python infer.py --image test.jpg --checkpoint runs/scrfd_mbf_fast/best.pt --output out.jpg
 """
 
 import argparse
@@ -25,27 +17,20 @@ from models.scrfd_mbf import SCRFD_MBF
 from models.scrfd_utils import generate_points, flatten_head_outputs, decode_points
 
 BOX_COLOR = (0, 200, 0)
-CORNER_COLORS = [
-    (0, 0, 255),    # index 0 - đỏ
-    (0, 255, 0),    # index 1 - xanh lá
-    (255, 0, 0),    # index 2 - xanh dương
-    (0, 255, 255),  # index 3 - vàng
-]
+CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]  # TL,TR,BR,BL
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Chạy thử SCRFD_MBF trên 1 ảnh")
     p.add_argument("--image", type=str, required=True)
-    p.add_argument("--checkpoint", type=str, default="", help="Đường dẫn .pt (PyTorch)")
-    p.add_argument("--onnx", type=str, default="", help="Đường dẫn .onnx (onnxruntime)")
-    p.add_argument("--output", type=str, default="", help="Mặc định: <image>_pred.jpg")
-    p.add_argument("--img-size", type=int, default=0, help="0 = lấy theo checkpoint/mặc định 640")
+    p.add_argument("--checkpoint", type=str, default="")
+    p.add_argument("--onnx", type=str, default="")
+    p.add_argument("--output", type=str, default="")
+    p.add_argument("--img-size", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--score-thr", type=float, default=0.3)
     p.add_argument("--nms-iou", type=float, default=0.5)
-    p.add_argument("--warmup", type=int, default=2,
-                    help="Số lần chạy 'đánh thức' model trước khi đo thời gian (không tính vào log)")
-    p.add_argument("--iters", type=int, default=5,
-                    help="Số lần lặp lại inference để đo thời gian xử lý trung bình")
+    p.add_argument("--warmup", type=int, default=2)
+    p.add_argument("--iters", type=int, default=5)
     return p.parse_args()
 
 
@@ -71,7 +56,7 @@ def run_torch_inference(model, img_size, img_tensor):
         scores = cls_logits.sigmoid()
         points, _, _ = generate_points(img_size)
         boxes, kps = decode_points(points, bbox_dist, kps_offset)
-    return scores[0], boxes[0], kps[0]  # bỏ chiều batch (batch=1)
+    return scores[0], boxes[0], kps[0]
 
 
 def load_onnx_session(onnx_path: str):
@@ -85,7 +70,6 @@ def run_onnx_inference(sess, img_tensor: torch.Tensor):
 
 
 def postprocess(scores, boxes, kps, score_thr, nms_iou):
-    """scores: (N, num_classes) | boxes: (N,4) | kps: (N,4,2) -> sau threshold + NMS."""
     max_scores, labels = scores.max(dim=-1)
     keep_mask = max_scores > score_thr
     boxes, max_scores, labels, kps = boxes[keep_mask], max_scores[keep_mask], labels[keep_mask], kps[keep_mask]
@@ -148,9 +132,6 @@ def main():
             return run_torch_inference(model, img_size, img_tensor)
         return run_onnx_inference(sess, img_tensor)
 
-    # "Đánh thức" model: chạy vài lần đầu không tính thời gian (cudnn autotune,
-    # onnxruntime lazy init phiên đầu, cache warm...) để số đo sau đó phản ánh
-    # đúng tốc độ inference ổn định, không lẫn overhead khởi động.
     for _ in range(max(args.warmup, 0)):
         infer_once()
     print(f"[infer] đã đánh thức model ({args.warmup} lần chạy khởi động, không tính thời gian)")

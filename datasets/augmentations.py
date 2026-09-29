@@ -1,10 +1,4 @@
-"""Augmentation cho ảnh biển số (áp dụng trên ảnh gốc, TRƯỚC bước letterbox).
-
-Toàn bộ transform hình học (flip, affine) tác động đồng thời lên box và 4 keypoint
-góc bằng cùng 1 ma trận biến đổi — không cần map lại "góc nào là góc nào" theo
-flip_idx của Roboflow, vì thứ tự góc luôn được chuẩn hoá lại bằng sort_corners()
-(models/scrfd_mbf.py) ngay sau khi letterbox, dựa trên toạ độ hình học cuối cùng.
-"""
+"""Augmentation cho ảnh biển số, áp dụng TRƯỚC letterbox."""
 
 import random
 from typing import Tuple
@@ -15,7 +9,6 @@ import numpy as np
 
 def augment_hsv(img: np.ndarray, hgain: float = 0.015, sgain: float = 0.7,
                  vgain: float = 0.4) -> np.ndarray:
-    """Jitter màu theo không gian HSV (chuẩn thực hành YOLOv5). img: RGB uint8."""
     if not (hgain or sgain or vgain):
         return img
     r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1
@@ -52,7 +45,6 @@ def random_flip_lr(img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
 
 
 def _transform_points(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
-    """pts: (..., 2), M: (3,3) affine matrix -> (..., 2) sau biến đổi."""
     shape = pts.shape
     flat = pts.reshape(-1, 2).astype(np.float32)
     ones = np.ones((flat.shape[0], 1), dtype=np.float32)
@@ -67,11 +59,7 @@ def random_affine(
     translate: float = 0.10, border_value=(114, 114, 114),
     min_area_ratio: float = 0.4, min_size: float = 4.0,
 ):
-    """Xoay nhẹ + scale + dịch chuyển ngẫu nhiên, giữ nguyên kích thước canvas gốc.
-
-    Trả về: img mới, boxes mới (đã clip vào canvas), kps mới, keep_mask (N,) bool
-    — object nào bị cắt mất phần lớn (do xoay/dịch ra khỏi khung) sẽ bị loại.
-    """
+    """-> img, boxes, kps, keep_mask (loại object bị cắt mất phần lớn sau transform)."""
     h, w = img.shape[:2]
 
     center = np.eye(3, dtype=np.float32)
@@ -127,8 +115,6 @@ def random_affine(
 
 def random_jpeg_compression(img: np.ndarray, p: float = 0.3,
                              quality_range: Tuple[int, int] = (25, 70)) -> np.ndarray:
-    """Mô phỏng nén JPEG chất lượng thấp (đặc trưng của camera NVR/streaming thật,
-    khác hẳn ảnh gốc chất lượng cao trong dataset Roboflow)."""
     if random.random() >= p:
         return img
     quality = random.randint(*quality_range)
@@ -142,8 +128,6 @@ def random_jpeg_compression(img: np.ndarray, p: float = 0.3,
 
 def random_gaussian_noise(img: np.ndarray, p: float = 0.3,
                            sigma_range: Tuple[float, float] = (3.0, 15.0)) -> np.ndarray:
-    """Nhiễu cảm biến — phổ biến ở camera thật trong điều kiện thiếu sáng, khác
-    ảnh dataset gốc thường được quay/chụp trong điều kiện tốt hơn."""
     if random.random() >= p:
         return img
     sigma = random.uniform(*sigma_range)
@@ -154,10 +138,9 @@ def random_gaussian_noise(img: np.ndarray, p: float = 0.3,
 
 def random_motion_blur(img: np.ndarray, p: float = 0.25,
                         kernel_range: Tuple[int, int] = (3, 9)) -> np.ndarray:
-    """Mờ chuyển động — xe di chuyển qua camera thật, khác ảnh tĩnh trong dataset."""
     if random.random() >= p:
         return img
-    k = random.randrange(kernel_range[0], kernel_range[1] + 1, 2)  # số lẻ
+    k = random.randrange(kernel_range[0], kernel_range[1] + 1, 2)
     angle = random.uniform(0, 180)
     kernel = np.zeros((k, k), dtype=np.float32)
     kernel[k // 2, :] = 1.0
@@ -169,8 +152,6 @@ def random_motion_blur(img: np.ndarray, p: float = 0.25,
 
 def random_gamma(img: np.ndarray, p: float = 0.4,
                   gamma_range: Tuple[float, float] = (0.5, 1.8)) -> np.ndarray:
-    """Thay đổi độ sáng/tương phản kiểu gamma — mô phỏng điều kiện ánh sáng khác
-    nhau giữa các camera thật (ngược sáng, ban đêm, đèn xe...)."""
     if random.random() >= p:
         return img
     gamma = random.uniform(*gamma_range)
@@ -181,8 +162,6 @@ def random_gamma(img: np.ndarray, p: float = 0.4,
 
 def random_downscale_upscale(img: np.ndarray, p: float = 0.25,
                               scale_range: Tuple[float, float] = (0.35, 0.7)) -> np.ndarray:
-    """Giảm rồi phóng lại độ phân giải — mô phỏng camera độ phân giải thấp/stream
-    nén mạnh, khác ảnh gốc sắc nét trong dataset."""
     if random.random() >= p:
         return img
     h, w = img.shape[:2]
@@ -197,17 +176,7 @@ def train_augment(
     translate: float = 0.10, hsv: Tuple[float, float, float] = (0.02, 0.8, 0.6),
     domain_robust: bool = True,
 ):
-    """Pipeline augment đầy đủ cho 1 ảnh (áp dụng cho train split).
-
-    boxes: (N,4) xyxy pixel | kps: (N,4,2) pixel — cùng hệ toạ độ ảnh gốc.
-    Trả về img, boxes, kps đã lọc theo keep_mask, và keep_mask để caller lọc labels.
-
-    `domain_robust=True` (mặc định) bật thêm các augmentation KHÔNG đổi toạ độ
-    (JPEG nén, nhiễu, mờ chuyển động, gamma, giảm/tăng độ phân giải) nhằm mô
-    phỏng sự khác biệt giữa ảnh dataset (Roboflow, chất lượng cao, tĩnh) và ảnh
-    camera thật lúc triển khai (nén mạnh, nhiễu, mờ, điều kiện sáng khác) — giảm
-    domain gap mà không cần thu thập/gán nhãn thêm dữ liệu thật.
-    """
+    """domain_robust=True: thêm JPEG/nhiễu/mờ/gamma/resize để mô phỏng camera thật."""
     img, boxes, kps = random_flip_lr(img, boxes, kps, p=flip_p)
     img, boxes, kps, keep = random_affine(
         img, boxes, kps, degrees=degrees, scale=scale, translate=translate,
@@ -219,7 +188,7 @@ def train_augment(
         img = random_motion_blur(img)
         img = random_downscale_upscale(img)
         img = random_gaussian_noise(img)
-        img = random_jpeg_compression(img)  # luôn để cuối cùng — nén là bước "hậu kỳ" cuối của ảnh thật
+        img = random_jpeg_compression(img)
 
     if boxes.shape[0]:
         boxes = boxes[keep]

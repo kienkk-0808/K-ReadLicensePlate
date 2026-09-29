@@ -1,8 +1,4 @@
-"""Đánh giá detection thật trong lúc train: mAP@0.5 (box) + NME keypoint (trên các
-match true-positive), thay vì chỉ dựa vào val loss để chọn checkpoint tốt nhất —
-loss thấp không chắc đã tương ứng chất lượng phát hiện tốt (đặc biệt giai đoạn đầu
-train khi cls loss có thể giảm nhanh dù bbox/kps còn kém).
-"""
+"""Đánh giá detection thật: mAP@0.5 (box) + NME keypoint (trên các match true-positive)."""
 
 from typing import Dict, List
 
@@ -29,15 +25,10 @@ def evaluate_metrics(
     score_thr: float = 0.05, nms_iou: float = 0.5, map_iou: float = 0.5,
     num_classes: int = 1,
 ) -> Dict[str, float]:
-    """Chạy model trên toàn bộ val_loader, trả về:
-        {"mAP50": ..., "kps_nme": ..., "AP50_class_<i>": ...}
-    mAP50 càng CAO càng tốt, kps_nme càng THẤP càng tốt.
-    """
+    """-> {"mAP50", "kps_nme", "AP50_class_<i>"}. mAP50 cao tốt, kps_nme thấp tốt."""
     model.eval()
 
-    # gt_records[class_id] = list of {"image_idx", "box"(4,), "kps"(4,2)}
     gt_records: Dict[int, List[dict]] = {c: [] for c in range(num_classes)}
-    # pred_records[class_id] = list of {"score", "box"(4,), "kps"(4,2), "image_idx"}
     pred_records: Dict[int, List[dict]] = {c: [] for c in range(num_classes)}
 
     img_idx = 0
@@ -74,11 +65,10 @@ def evaluate_metrics(
         num_gt = len(gts)
 
         if num_gt == 0:
-            ap_per_class[c] = None  # không có GT lớp này trong tập valid -> bỏ qua khi macro-average
+            ap_per_class[c] = None
             continue
 
         matched = [False] * num_gt
-        # gom GT theo image để tra cứu nhanh
         gts_by_image: Dict[int, List[int]] = {}
         for gi, g in enumerate(gts):
             gts_by_image.setdefault(g["image_idx"], []).append(gi)

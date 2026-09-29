@@ -1,11 +1,6 @@
-"""Export SCRFD_MBF (checkpoint .pt từ train.py) sang ONNX để triển khai edge/embedded.
+"""Export SCRFD_MBF sang ONNX (decode đã bọc sẵn trong đồ thị, chỉ cần threshold+NMS).
 
-Model wrapper bọc sẵn bước decode (sigmoid cls + quy đổi l,t,r,b / dx,dy về pixel
-tuyệt đối) vào trong đồ thị ONNX — runtime triển khai (C++/NPU SDK) chỉ cần
-threshold theo score rồi NMS, không phải cài lại công thức decode.
-
-Ví dụ chạy:
-    python export_onnx.py --checkpoint runs/scrfd_mbf_fast/best.pt --output runs/scrfd_mbf_fast/model.onnx
+Ví dụ: python export_onnx.py --checkpoint runs/scrfd_mbf_fast/best.pt --output model.onnx
 """
 
 import argparse
@@ -20,12 +15,7 @@ from models.scrfd_utils import generate_points, flatten_head_outputs, decode_poi
 
 
 class SCRFDONNXWrapper(nn.Module):
-    """Input: ảnh (1,3,H,W) float32, giá trị [0,1] (RGB, đã letterbox sẵn ở tiền xử lý).
-    Output:
-        scores: (1, N, num_classes) — đã sigmoid, N = tổng anchor point 3 level.
-        boxes:  (1, N, 4) — x1,y1,x2,y2 pixel, cùng hệ toạ độ với ảnh input (H,W).
-        kps:    (1, N, 4, 2) — 4 góc biển số, pixel, cùng hệ toạ độ ảnh input.
-    """
+    """Input (1,3,H,W) [0,1] -> scores(1,N,C) sigmoid, boxes(1,N,4) xyxy, kps(1,N,4,2)."""
 
     def __init__(self, model: SCRFD_MBF, img_size: int):
         super().__init__()
@@ -43,15 +33,14 @@ class SCRFDONNXWrapper(nn.Module):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Export SCRFD_MBF sang ONNX")
-    p.add_argument("--checkpoint", type=str, required=True, help="Đường dẫn best.pt/last.pt")
-    p.add_argument("--output", type=str, default="", help="Đường dẫn .onnx xuất ra (mặc định cùng thư mục checkpoint)")
-    p.add_argument("--img-size", type=int, default=0, help="0 = lấy theo args lưu trong checkpoint")
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--output", type=str, default="")
+    p.add_argument("--img-size", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--width-mult", type=float, default=0.0, help="0 = lấy theo checkpoint")
     p.add_argument("--fpn-channels", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--num-classes", type=int, default=0, help="0 = lấy theo checkpoint")
-    p.add_argument("--opset", type=int, default=18,
-                    help="Op Resize (upsample trong PAFPN) yêu cầu tối thiểu opset 18")
-    p.add_argument("--dynamic-batch", action="store_true", help="Cho phép batch size động (mặc định cố định batch=1)")
+    p.add_argument("--opset", type=int, default=18)
+    p.add_argument("--dynamic-batch", action="store_true")
     return p.parse_args()
 
 
@@ -106,10 +95,7 @@ def main():
 
 
 def _merge_external_data_into_single_file(output_path: Path):
-    """torch.onnx.export (dynamo exporter) mặc định tách weight lớn ra file
-    '<name>.onnx.data' riêng (external data). Gộp lại thành đúng 1 file .onnx để
-    dễ đóng gói/deploy — nạp lại toàn bộ weight vào bộ nhớ rồi ghi đè ở dạng embed.
-    """
+    """torch.onnx.export mặc định tách weight ra file .onnx.data riêng — gộp lại 1 file."""
     import onnx
 
     data_file = output_path.with_name(output_path.name + ".data")
@@ -120,7 +106,6 @@ def _merge_external_data_into_single_file(output_path: Path):
 
 
 def verify(wrapper: nn.Module, onnx_path: Path, dummy: torch.Tensor):
-    """Kiểm tra đồ thị hợp lệ (onnx.checker) + so khớp số học với PyTorch (onnxruntime)."""
     import onnx
     import onnxruntime as ort
 
