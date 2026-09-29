@@ -296,14 +296,24 @@ def main():
                     # số + optimizer từ best.pt rồi reset bộ đếm ("lấy best ra train tiếp").
                     best_path = output_dir / "best.pt"
                     if best_path.exists():
+                        # Lưu lại LR hiện tại của scheduler TRƯỚC khi nạp optimizer từ
+                        # best.pt. CosineAnnealingLR của PyTorch tính LR epoch sau bằng
+                        # công thức "chainable" (nhân tỉ lệ với LR ĐANG NẰM TRONG optimizer),
+                        # không phải hàm độc lập theo epoch — nếu để optimizer.load_state_dict
+                        # nạp đè LR cũ (của epoch lúc best.pt được lưu) vào optimizer, lần
+                        # scheduler.step() kế tiếp sẽ tính nhân dựa trên LR bị "lùi ngược" đó,
+                        # có thể khiến LR tăng ngược hoặc lệch khỏi đường cong giảm dần dự kiến.
+                        current_lr = scheduler.get_last_lr()
                         best_ckpt = torch.load(best_path, map_location=device)
                         model.load_state_dict(best_ckpt["model"])
                         optimizer.load_state_dict(best_ckpt["optimizer"])
+                        for group, lr in zip(optimizer.param_groups, current_lr):
+                            group["lr"] = lr
                         reverted = True
                         epochs_since_improve = 0
                         print(
                             f"[epoch {epoch}] du {args.patience} epoch khong cai thien "
-                            f"-> nap lai trong so best.pt cho epoch sau"
+                            f"-> nap lai trong so best.pt cho epoch sau (giu nguyen lr={current_lr[0]:.6f})"
                         )
 
             log_epoch_csv({

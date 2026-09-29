@@ -125,21 +125,101 @@ def random_affine(
     return img_out, new_boxes, kps_t, keep
 
 
+def random_jpeg_compression(img: np.ndarray, p: float = 0.3,
+                             quality_range: Tuple[int, int] = (25, 70)) -> np.ndarray:
+    """Mô phỏng nén JPEG chất lượng thấp (đặc trưng của camera NVR/streaming thật,
+    khác hẳn ảnh gốc chất lượng cao trong dataset Roboflow)."""
+    if random.random() >= p:
+        return img
+    quality = random.randint(*quality_range)
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    ok, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return img
+    dec = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+    return cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
+
+
+def random_gaussian_noise(img: np.ndarray, p: float = 0.3,
+                           sigma_range: Tuple[float, float] = (3.0, 15.0)) -> np.ndarray:
+    """Nhiễu cảm biến — phổ biến ở camera thật trong điều kiện thiếu sáng, khác
+    ảnh dataset gốc thường được quay/chụp trong điều kiện tốt hơn."""
+    if random.random() >= p:
+        return img
+    sigma = random.uniform(*sigma_range)
+    noise = np.random.normal(0, sigma, img.shape).astype(np.float32)
+    out = img.astype(np.float32) + noise
+    return np.clip(out, 0, 255).astype(img.dtype)
+
+
+def random_motion_blur(img: np.ndarray, p: float = 0.25,
+                        kernel_range: Tuple[int, int] = (3, 9)) -> np.ndarray:
+    """Mờ chuyển động — xe di chuyển qua camera thật, khác ảnh tĩnh trong dataset."""
+    if random.random() >= p:
+        return img
+    k = random.randrange(kernel_range[0], kernel_range[1] + 1, 2)  # số lẻ
+    angle = random.uniform(0, 180)
+    kernel = np.zeros((k, k), dtype=np.float32)
+    kernel[k // 2, :] = 1.0
+    M = cv2.getRotationMatrix2D((k / 2 - 0.5, k / 2 - 0.5), angle, 1.0)
+    kernel = cv2.warpAffine(kernel, M, (k, k))
+    kernel /= max(kernel.sum(), 1e-6)
+    return cv2.filter2D(img, -1, kernel)
+
+
+def random_gamma(img: np.ndarray, p: float = 0.4,
+                  gamma_range: Tuple[float, float] = (0.5, 1.8)) -> np.ndarray:
+    """Thay đổi độ sáng/tương phản kiểu gamma — mô phỏng điều kiện ánh sáng khác
+    nhau giữa các camera thật (ngược sáng, ban đêm, đèn xe...)."""
+    if random.random() >= p:
+        return img
+    gamma = random.uniform(*gamma_range)
+    inv_gamma = 1.0 / gamma
+    table = ((np.arange(0, 256) / 255.0) ** inv_gamma * 255).astype(np.uint8)
+    return cv2.LUT(img, table)
+
+
+def random_downscale_upscale(img: np.ndarray, p: float = 0.25,
+                              scale_range: Tuple[float, float] = (0.35, 0.7)) -> np.ndarray:
+    """Giảm rồi phóng lại độ phân giải — mô phỏng camera độ phân giải thấp/stream
+    nén mạnh, khác ảnh gốc sắc nét trong dataset."""
+    if random.random() >= p:
+        return img
+    h, w = img.shape[:2]
+    s = random.uniform(*scale_range)
+    small = cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def train_augment(
     img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
     flip_p: float = 0.5, degrees: float = 10.0, scale: Tuple[float, float] = (0.75, 1.25),
-    translate: float = 0.10, hsv: Tuple[float, float, float] = (0.015, 0.7, 0.4),
+    translate: float = 0.10, hsv: Tuple[float, float, float] = (0.02, 0.8, 0.6),
+    domain_robust: bool = True,
 ):
     """Pipeline augment đầy đủ cho 1 ảnh (áp dụng cho train split).
 
     boxes: (N,4) xyxy pixel | kps: (N,4,2) pixel — cùng hệ toạ độ ảnh gốc.
     Trả về img, boxes, kps đã lọc theo keep_mask, và keep_mask để caller lọc labels.
+
+    `domain_robust=True` (mặc định) bật thêm các augmentation KHÔNG đổi toạ độ
+    (JPEG nén, nhiễu, mờ chuyển động, gamma, giảm/tăng độ phân giải) nhằm mô
+    phỏng sự khác biệt giữa ảnh dataset (Roboflow, chất lượng cao, tĩnh) và ảnh
+    camera thật lúc triển khai (nén mạnh, nhiễu, mờ, điều kiện sáng khác) — giảm
+    domain gap mà không cần thu thập/gán nhãn thêm dữ liệu thật.
     """
     img, boxes, kps = random_flip_lr(img, boxes, kps, p=flip_p)
     img, boxes, kps, keep = random_affine(
         img, boxes, kps, degrees=degrees, scale=scale, translate=translate,
     )
     img = augment_hsv(img, *hsv)
+
+    if domain_robust:
+        img = random_gamma(img)
+        img = random_motion_blur(img)
+        img = random_downscale_upscale(img)
+        img = random_gaussian_noise(img)
+        img = random_jpeg_compression(img)  # luôn để cuối cùng — nén là bước "hậu kỳ" cuối của ảnh thật
 
     if boxes.shape[0]:
         boxes = boxes[keep]
