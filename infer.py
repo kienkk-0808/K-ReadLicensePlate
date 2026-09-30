@@ -25,6 +25,8 @@ def parse_args():
     p.add_argument("--image", type=str, required=True)
     p.add_argument("--checkpoint", type=str, default="")
     p.add_argument("--onnx", type=str, default="")
+    p.add_argument("--model-ov", type=str, default="", help="Đường dẫn .xml OpenVINO IR")
+    p.add_argument("--ov-device", type=str, default="CPU", help="CPU/GPU/NPU (tuỳ máy hỗ trợ)")
     p.add_argument("--output", type=str, default="")
     p.add_argument("--img-size", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--score-thr", type=float, default=0.3)
@@ -69,6 +71,20 @@ def run_onnx_inference(sess, img_tensor: torch.Tensor):
     return torch.from_numpy(scores[0]), torch.from_numpy(boxes[0]), torch.from_numpy(kps[0])
 
 
+def load_ov_model(model_path: str, device: str = "CPU"):
+    import openvino as ov
+    core = ov.Core()
+    return core.compile_model(model_path, device)
+
+
+def run_ov_inference(compiled, img_tensor: torch.Tensor):
+    out = compiled(img_tensor.numpy())
+    scores = out[compiled.output("scores")]
+    boxes = out[compiled.output("boxes")]
+    kps = out[compiled.output("kps")]
+    return torch.from_numpy(scores[0]), torch.from_numpy(boxes[0]), torch.from_numpy(kps[0])
+
+
 def postprocess(scores, boxes, kps, score_thr, nms_iou):
     max_scores, labels = scores.max(dim=-1)
     keep_mask = max_scores > score_thr
@@ -108,8 +124,8 @@ def draw_predictions(img_bgr, boxes, scores, labels, kps):
 
 def main():
     args = parse_args()
-    if not args.checkpoint and not args.onnx:
-        raise ValueError("Cần truyền --checkpoint hoặc --onnx")
+    if not args.checkpoint and not args.onnx and not args.model_ov:
+        raise ValueError("Cần truyền --checkpoint, --onnx hoặc --model-ov")
 
     img_path = Path(args.image)
     img_bgr = cv2.imread(str(img_path))
@@ -120,9 +136,10 @@ def main():
     img_size = args.img_size or 640
     if args.checkpoint:
         model, img_size = load_torch_model(args.checkpoint, args.img_size)
-    else:
+    elif args.onnx:
         sess = load_onnx_session(args.onnx)
-        img_size = args.img_size or img_size
+    else:
+        compiled = load_ov_model(args.model_ov, args.ov_device)
 
     canvas, scale, pad = letterbox(img_rgb, img_size)
     img_tensor = torch.from_numpy(canvas).permute(2, 0, 1).float().unsqueeze(0) / 255.0
@@ -130,7 +147,9 @@ def main():
     def infer_once():
         if args.checkpoint:
             return run_torch_inference(model, img_size, img_tensor)
-        return run_onnx_inference(sess, img_tensor)
+        if args.onnx:
+            return run_onnx_inference(sess, img_tensor)
+        return run_ov_inference(compiled, img_tensor)
 
     for _ in range(max(args.warmup, 0)):
         infer_once()

@@ -41,6 +41,9 @@ def parse_args():
     p.add_argument("--num-classes", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--opset", type=int, default=18)
     p.add_argument("--dynamic-batch", action="store_true")
+    p.add_argument("--ov", action="store_true", help="Convert thêm sang OpenVINO IR (.xml/.bin)")
+    p.add_argument("--ov-fp16", action="store_true", default=True,
+                    help="Nén weight OpenVINO về FP16 (mặc định bật)")
     return p.parse_args()
 
 
@@ -92,6 +95,36 @@ def main():
     print(f"[export] đã ghi {output_path} (1 file duy nhất, không tách weight riêng)")
 
     verify(wrapper, output_path, dummy)
+
+    if args.ov:
+        export_openvino(output_path, dummy, args.ov_fp16)
+
+
+def export_openvino(onnx_path: Path, dummy: torch.Tensor, fp16: bool):
+    import openvino as ov
+
+    ov_path = onnx_path.with_suffix(".xml")
+    ov_model = ov.convert_model(str(onnx_path))
+    ov.save_model(ov_model, str(ov_path), compress_to_fp16=fp16)
+    print(f"[export] đã ghi {ov_path} (+ .bin)")
+
+    core = ov.Core()
+    compiled = core.compile_model(ov_model, "CPU")
+    ov_out = compiled(dummy.numpy())
+    ov_scores = ov_out[compiled.output("scores")]
+    ov_boxes = ov_out[compiled.output("boxes")]
+    ov_kps = ov_out[compiled.output("kps")]
+
+    import onnxruntime as ort
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    onnx_scores, onnx_boxes, onnx_kps = sess.run(None, {"image": dummy.numpy()})
+
+    for name, a, b in [("scores", onnx_scores, ov_scores), ("boxes", onnx_boxes, ov_boxes),
+                        ("kps", onnx_kps, ov_kps)]:
+        max_diff = np.abs(a - b).max()
+        tol = 1e-2 if fp16 else 1e-4
+        ok = np.allclose(a, b, atol=tol, rtol=1e-2 if fp16 else 1e-3)
+        print(f"[verify-ov] {name}: max_diff={max_diff:.6f} match={ok}")
 
 
 def _merge_external_data_into_single_file(output_path: Path):
