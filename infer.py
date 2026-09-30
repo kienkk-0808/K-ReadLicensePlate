@@ -45,6 +45,7 @@ def load_torch_model(checkpoint_path: str, img_size_override: int):
         fpn_channels=args.get("fpn_channels", 48),
         num_classes=args.get("num_classes", 1),
         stacked_convs=args.get("stacked_convs", 2),
+        reg_max=args.get("reg_max", 16),
     )
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -54,10 +55,10 @@ def load_torch_model(checkpoint_path: str, img_size_override: int):
 def run_torch_inference(model, img_size, img_tensor):
     with torch.no_grad():
         outputs = model(img_tensor)
-        cls_logits, bbox_dist = flatten_head_outputs(outputs)
+        cls_logits, bbox_logits = flatten_head_outputs(outputs)
         scores = cls_logits.sigmoid()
-        points, _, _ = generate_points(img_size)
-        boxes = decode_points(points, bbox_dist)
+        points, strides_per_point, _ = generate_points(img_size)
+        boxes = decode_points(points, strides_per_point, bbox_logits, model.reg_max)
     return scores[0], boxes[0]
 
 

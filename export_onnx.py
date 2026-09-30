@@ -20,14 +20,15 @@ class SCRFDONNXWrapper(nn.Module):
     def __init__(self, model: SCRFD_MBF, img_size: int):
         super().__init__()
         self.model = model
-        points, _, _ = generate_points(img_size)
+        points, strides_per_point, _ = generate_points(img_size)
         self.register_buffer("points", points)
+        self.register_buffer("strides_per_point", strides_per_point)
 
     def forward(self, x):
         outputs = self.model(x)
-        cls_logits, bbox_dist = flatten_head_outputs(outputs)
+        cls_logits, bbox_logits = flatten_head_outputs(outputs)
         scores = cls_logits.sigmoid()
-        boxes = decode_points(self.points, bbox_dist)
+        boxes = decode_points(self.points, self.strides_per_point, bbox_logits, self.model.reg_max)
         return scores, boxes
 
 
@@ -40,6 +41,7 @@ def parse_args():
     p.add_argument("--fpn-channels", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--num-classes", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--stacked-convs", type=int, default=0, help="0 = lấy theo checkpoint")
+    p.add_argument("--reg-max", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--opset", type=int, default=18)
     p.add_argument("--dynamic-batch", action="store_true")
     p.add_argument("--ov", action="store_true", help="Convert thêm sang OpenVINO IR (.xml/.bin)")
@@ -58,14 +60,16 @@ def main():
     fpn_channels = args.fpn_channels or ckpt_args.get("fpn_channels", 48)
     num_classes = args.num_classes or ckpt_args.get("num_classes", 1)
     stacked_convs = args.stacked_convs or ckpt_args.get("stacked_convs", 2)
+    reg_max = args.reg_max or ckpt_args.get("reg_max", 16)
 
     print(f"[config] img_size={img_size} width_mult={width_mult} "
-          f"fpn_channels={fpn_channels} num_classes={num_classes} stacked_convs={stacked_convs}")
+          f"fpn_channels={fpn_channels} num_classes={num_classes} "
+          f"stacked_convs={stacked_convs} reg_max={reg_max}")
     if "det_metrics" in ckpt:
         print(f"[checkpoint] epoch={ckpt.get('epoch')} det_metrics={ckpt['det_metrics']}")
 
     model = SCRFD_MBF(width_mult=width_mult, fpn_channels=fpn_channels, num_classes=num_classes,
-                       stacked_convs=stacked_convs)
+                       stacked_convs=stacked_convs, reg_max=reg_max)
     model.load_state_dict(ckpt["model"])
     model.eval()
 

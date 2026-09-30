@@ -120,20 +120,26 @@ class PAFPN(nn.Module):
         return p3, p4, p5
 
 
-class ScaleExp(nn.Module):
-    def __init__(self, init_value: float = 1.0):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
+def dfl_to_distance(bbox_logits: torch.Tensor, reg_max: int) -> torch.Tensor:
+    """bbox_logits(...,4*(reg_max+1)) raw -> (...,4) khoảng cách kỳ vọng, đơn vị stride.
 
-    def forward(self, x):
-        return x * self.scale
+    DFL (Distribution Focal Loss, YOLOv8/GFocal): thay vì hồi quy 1 số thực cho mỗi
+    cạnh (l,t,r,b), dự đoán 1 phân phối rời rạc trên reg_max+1 bin rồi lấy kỳ vọng
+    (expected value) — cho độ chính xác sub-pixel tốt hơn hồi quy trực tiếp.
+    """
+    shape = bbox_logits.shape[:-1]
+    x = bbox_logits.reshape(*shape, 4, reg_max + 1)
+    prob = F.softmax(x, dim=-1)
+    bins = torch.arange(reg_max + 1, dtype=prob.dtype, device=prob.device)
+    return (prob * bins).sum(dim=-1)
 
 
 class SCRFDHead(nn.Module):
     def __init__(self, in_channels: int = 48, stacked_convs: int = 2, num_groups: int = 8,
-                 num_classes: int = 1):
+                 num_classes: int = 1, reg_max: int = 16):
         super().__init__()
         self.num_classes = num_classes
+        self.reg_max = reg_max
 
         def make_stem():
             layers = []
@@ -149,9 +155,7 @@ class SCRFDHead(nn.Module):
         self.bbox_stem = make_stem()
 
         self.cls_pred = nn.Conv2d(in_channels, num_classes, 3, 1, 1)
-        self.bbox_pred = nn.Conv2d(in_channels, 4, 3, 1, 1)
-
-        self.bbox_scales = nn.ModuleList([ScaleExp(1.0) for _ in STRIDES])
+        self.bbox_pred = nn.Conv2d(in_channels, 4 * (reg_max + 1), 3, 1, 1)
 
         self._init_weights()
 
@@ -162,30 +166,26 @@ class SCRFDHead(nn.Module):
         prior_prob = 0.01
         nn.init.constant_(self.cls_pred.bias, -math.log((1 - prior_prob) / prior_prob))
 
-    def forward_single(self, feat, level_idx: int):
-        stride = STRIDES[level_idx]
-
+    def forward_single(self, feat):
         cls_score = self.cls_pred(self.cls_stem(feat))
-
-        bbox_dist = self.bbox_pred(self.bbox_stem(feat))
-        bbox_dist = F.relu(self.bbox_scales[level_idx](bbox_dist)) * stride
-
-        return cls_score, bbox_dist
+        bbox_logits = self.bbox_pred(self.bbox_stem(feat))
+        return cls_score, bbox_logits
 
     def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
-        return [self.forward_single(feat, i) for i, feat in enumerate(feats)]
+        return [self.forward_single(feat) for feat in feats]
 
 
 class SCRFD_MBF(nn.Module):
     def __init__(self, width_mult: float = 1.0, fpn_channels: int = 48, num_classes: int = 1,
-                 stacked_convs: int = 2):
+                 stacked_convs: int = 2, reg_max: int = 16):
         super().__init__()
         self.backbone = MBFBackbone(width_mult=width_mult)
         self.neck = PAFPN(self.backbone.out_channels, out_channels=fpn_channels)
         self.head = SCRFDHead(in_channels=fpn_channels, num_classes=num_classes,
-                               stacked_convs=stacked_convs)
+                               stacked_convs=stacked_convs, reg_max=reg_max)
         self.strides = STRIDES
         self.num_classes = num_classes
+        self.reg_max = reg_max
 
     def forward(self, x):
         feats = self.backbone(x)
@@ -198,7 +198,7 @@ class SCRFD_MBF(nn.Module):
         batch_size = outputs[0][0].shape[0]
         results = [[] for _ in range(batch_size)]
 
-        for level_idx, (cls_score, bbox_dist) in enumerate(outputs):
+        for level_idx, (cls_score, bbox_logits) in enumerate(outputs):
             stride = self.strides[level_idx]
             b, num_classes, h, w = cls_score.shape
 
@@ -213,7 +213,8 @@ class SCRFD_MBF(nn.Module):
             px = (xv.reshape(-1).float() + 0.5) * stride
             py = (yv.reshape(-1).float() + 0.5) * stride
 
-            bbox_dist = bbox_dist.permute(0, 2, 3, 1).reshape(b, h * w, 4)
+            bbox_logits = bbox_logits.permute(0, 2, 3, 1).reshape(b, h * w, 4 * (self.reg_max + 1))
+            bbox_dist = dfl_to_distance(bbox_logits, self.reg_max) * stride
 
             x1 = px - bbox_dist[..., 0]
             y1 = py - bbox_dist[..., 1]

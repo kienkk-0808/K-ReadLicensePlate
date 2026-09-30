@@ -32,6 +32,7 @@ def parse_args():
     p.add_argument("--width-mult", type=float, default=1.0)
     p.add_argument("--fpn-channels", type=int, default=48)
     p.add_argument("--stacked-convs", type=int, default=2)
+    p.add_argument("--reg-max", type=int, default=16, help="Số bin DFL cho mỗi cạnh bbox")
     p.add_argument("--num-classes", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -47,6 +48,7 @@ def parse_args():
     p.add_argument("--nms-iou", type=float, default=0.5)
     p.add_argument("--lambda-cls", type=float, default=1.0)
     p.add_argument("--lambda-bbox", type=float, default=1.0)
+    p.add_argument("--lambda-dfl", type=float, default=0.25)
     return p.parse_args()
 
 
@@ -73,7 +75,7 @@ def build_dataloaders(args):
 @torch.no_grad()
 def evaluate(model, loss_fn, val_loader, device):
     model.eval()
-    totals = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0}
+    totals = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0, "dfl_loss": 0.0}
     num_batches = 0
 
     for imgs, targets in val_loader:
@@ -101,7 +103,7 @@ def main():
 
     metrics_csv_path = output_dir / "metrics.csv"
     csv_fieldnames = [
-        "epoch", "lr", "train_loss", "train_cls", "train_bbox",
+        "epoch", "lr", "train_loss", "train_cls", "train_bbox", "train_dfl",
         "val_loss", "mAP50", "mAP75", "score", "score_ema",
         "is_best", "reverted", "epochs_since_improve",
     ]
@@ -116,11 +118,13 @@ def main():
     model = SCRFD_MBF(
         width_mult=args.width_mult, fpn_channels=args.fpn_channels,
         num_classes=args.num_classes, stacked_convs=args.stacked_convs,
+        reg_max=args.reg_max,
     ).to(device)
 
     loss_fn = SCRFDLoss(
         img_size=args.img_size, num_classes=args.num_classes,
-        lambda_cls=args.lambda_cls, lambda_bbox=args.lambda_bbox,
+        lambda_cls=args.lambda_cls, lambda_bbox=args.lambda_bbox, lambda_dfl=args.lambda_dfl,
+        reg_max=args.reg_max,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -145,8 +149,8 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_start = time.time()
-        running = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0}
-        epoch_totals = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0}
+        running = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0, "dfl_loss": 0.0}
+        epoch_totals = {"loss": 0.0, "cls_loss": 0.0, "bbox_loss": 0.0, "dfl_loss": 0.0}
 
         for step, (imgs, targets) in enumerate(train_loader):
             imgs = imgs.to(device)
@@ -171,6 +175,7 @@ def main():
                     f"loss={running['loss'] / n:.4f} "
                     f"cls={running['cls_loss'] / n:.4f} "
                     f"bbox={running['bbox_loss'] / n:.4f} "
+                    f"dfl={running['dfl_loss'] / n:.4f} "
                     f"num_pos={loss_dict['num_pos'].item():.0f}"
                 )
                 running = {k: 0.0 for k in running}
@@ -188,7 +193,7 @@ def main():
             log_epoch_csv({
                 "epoch": epoch, "lr": cur_lr,
                 "train_loss": epoch_avg["loss"], "train_cls": epoch_avg["cls_loss"],
-                "train_bbox": epoch_avg["bbox_loss"],
+                "train_bbox": epoch_avg["bbox_loss"], "train_dfl": epoch_avg["dfl_loss"],
                 "val_loss": "", "mAP50": "", "mAP75": "", "score": "",
                 "score_ema": "", "is_best": "", "reverted": "", "epochs_since_improve": "",
             })
@@ -263,7 +268,7 @@ def main():
             log_epoch_csv({
                 "epoch": epoch, "lr": cur_lr,
                 "train_loss": epoch_avg["loss"], "train_cls": epoch_avg["cls_loss"],
-                "train_bbox": epoch_avg["bbox_loss"],
+                "train_bbox": epoch_avg["bbox_loss"], "train_dfl": epoch_avg["dfl_loss"],
                 "val_loss": val_loss_metrics["loss"], "mAP50": det_metrics["mAP50"],
                 "mAP75": det_metrics["mAP75"], "score": score,
                 "score_ema": score_ema, "is_best": int(is_best), "reverted": int(reverted),
