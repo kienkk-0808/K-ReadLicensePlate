@@ -1,4 +1,4 @@
-"""Chạy thử model (.pt hoặc .onnx) trên 1 ảnh, vẽ box + 4 keypoint, lưu ra file.
+"""Chạy thử model (.pt/.onnx/.xml) trên 1 ảnh, vẽ box, lưu ra file.
 
 Ví dụ: python infer.py --image test.jpg --checkpoint runs/scrfd_mbf_fast/best.pt --output out.jpg
 """
@@ -17,7 +17,6 @@ from models.scrfd_mbf import SCRFD_MBF
 from models.scrfd_utils import generate_points, flatten_head_outputs, decode_points
 
 BOX_COLOR = (0, 200, 0)
-CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]  # TL,TR,BR,BL
 
 
 def parse_args():
@@ -43,8 +42,9 @@ def load_torch_model(checkpoint_path: str, img_size_override: int):
 
     model = SCRFD_MBF(
         width_mult=args.get("width_mult", 1.0),
-        fpn_channels=args.get("fpn_channels", 32),
+        fpn_channels=args.get("fpn_channels", 48),
         num_classes=args.get("num_classes", 1),
+        stacked_convs=args.get("stacked_convs", 2),
     )
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -54,11 +54,11 @@ def load_torch_model(checkpoint_path: str, img_size_override: int):
 def run_torch_inference(model, img_size, img_tensor):
     with torch.no_grad():
         outputs = model(img_tensor)
-        cls_logits, bbox_dist, kps_offset = flatten_head_outputs(outputs)
+        cls_logits, bbox_dist = flatten_head_outputs(outputs)
         scores = cls_logits.sigmoid()
         points, _, _ = generate_points(img_size)
-        boxes, kps = decode_points(points, bbox_dist, kps_offset)
-    return scores[0], boxes[0], kps[0]
+        boxes = decode_points(points, bbox_dist)
+    return scores[0], boxes[0]
 
 
 def load_onnx_session(onnx_path: str):
@@ -67,8 +67,8 @@ def load_onnx_session(onnx_path: str):
 
 
 def run_onnx_inference(sess, img_tensor: torch.Tensor):
-    scores, boxes, kps = sess.run(None, {"image": img_tensor.numpy()})
-    return torch.from_numpy(scores[0]), torch.from_numpy(boxes[0]), torch.from_numpy(kps[0])
+    scores, boxes = sess.run(None, {"image": img_tensor.numpy()})
+    return torch.from_numpy(scores[0]), torch.from_numpy(boxes[0])
 
 
 def load_ov_model(model_path: str, device: str = "CPU"):
@@ -81,43 +81,37 @@ def run_ov_inference(compiled, img_tensor: torch.Tensor):
     out = compiled(img_tensor.numpy())
     scores = out[compiled.output("scores")]
     boxes = out[compiled.output("boxes")]
-    kps = out[compiled.output("kps")]
-    return torch.from_numpy(scores[0]), torch.from_numpy(boxes[0]), torch.from_numpy(kps[0])
+    return torch.from_numpy(scores[0]), torch.from_numpy(boxes[0])
 
 
-def postprocess(scores, boxes, kps, score_thr, nms_iou):
+def postprocess(scores, boxes, score_thr, nms_iou):
     max_scores, labels = scores.max(dim=-1)
     keep_mask = max_scores > score_thr
-    boxes, max_scores, labels, kps = boxes[keep_mask], max_scores[keep_mask], labels[keep_mask], kps[keep_mask]
+    boxes, max_scores, labels = boxes[keep_mask], max_scores[keep_mask], labels[keep_mask]
 
     if boxes.shape[0] == 0:
-        return boxes, max_scores, labels, kps
+        return boxes, max_scores, labels
 
     keep = batched_nms(boxes, max_scores, labels, nms_iou)
-    return boxes[keep], max_scores[keep], labels[keep], kps[keep]
+    return boxes[keep], max_scores[keep], labels[keep]
 
 
-def unletterbox_points(pts: np.ndarray, scale: float, pad: tuple) -> np.ndarray:
+def unletterbox_boxes(boxes: np.ndarray, scale: float, pad: tuple) -> np.ndarray:
     pad_x, pad_y = pad
-    out = pts.copy()
-    out[..., 0] = (out[..., 0] - pad_x) / scale
-    out[..., 1] = (out[..., 1] - pad_y) / scale
+    out = boxes.copy()
+    out[:, [0, 2]] = (out[:, [0, 2]] - pad_x) / scale
+    out[:, [1, 3]] = (out[:, [1, 3]] - pad_y) / scale
     return out
 
 
-def draw_predictions(img_bgr, boxes, scores, labels, kps):
-    for box, score, label, kp in zip(boxes, scores, labels, kps):
+def draw_predictions(img_bgr, boxes, scores, labels):
+    for box, score, label in zip(boxes, scores, labels):
         x1, y1, x2, y2 = box.astype(int)
         cv2.rectangle(img_bgr, (x1, y1), (x2, y2), BOX_COLOR, 2)
 
         text = f"{CLASS_NAMES[int(label)]} {score:.2f}"
         cv2.putText(img_bgr, text, (x1, max(y1 - 8, 0)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, BOX_COLOR, 2, cv2.LINE_AA)
-
-        pts = kp.astype(int)
-        for i in range(4):
-            cv2.circle(img_bgr, tuple(pts[i]), 4, CORNER_COLORS[i], -1)
-            cv2.line(img_bgr, tuple(pts[i]), tuple(pts[(i + 1) % 4]), (255, 255, 255), 1)
 
     return img_bgr
 
@@ -156,10 +150,10 @@ def main():
     print(f"[infer] đã đánh thức model ({args.warmup} lần chạy khởi động, không tính thời gian)")
 
     latencies_ms = []
-    scores = boxes = kps = None
+    scores = boxes = None
     for _ in range(max(args.iters, 1)):
         t0 = time.perf_counter()
-        scores, boxes, kps = infer_once()
+        scores, boxes = infer_once()
         latencies_ms.append((time.perf_counter() - t0) * 1000)
 
     avg_ms = sum(latencies_ms) / len(latencies_ms)
@@ -169,16 +163,15 @@ def main():
         f"(trung bình {len(latencies_ms)} lần, ảnh {img_size}x{img_size})"
     )
 
-    boxes, scores, labels, kps = postprocess(scores, boxes, kps, args.score_thr, args.nms_iou)
+    boxes, scores, labels = postprocess(scores, boxes, args.score_thr, args.nms_iou)
     print(f"[infer] phát hiện {boxes.shape[0]} biển số (score > {args.score_thr})")
 
-    boxes_np = unletterbox_points(boxes.numpy().reshape(-1, 2, 2), scale, pad).reshape(-1, 4)
-    kps_np = unletterbox_points(kps.numpy(), scale, pad)
+    boxes_np = unletterbox_boxes(boxes.numpy(), scale, pad)
 
     for i, (b, s, l) in enumerate(zip(boxes_np, scores.numpy(), labels.numpy())):
         print(f"  #{i}: {CLASS_NAMES[int(l)]} score={s:.3f} box={b.round(1).tolist()}")
 
-    result_img = draw_predictions(img_bgr.copy(), boxes_np, scores.numpy(), labels.numpy(), kps_np)
+    result_img = draw_predictions(img_bgr.copy(), boxes_np, scores.numpy(), labels.numpy())
 
     output_path = Path(args.output) if args.output else img_path.with_name(img_path.stem + "_pred.jpg")
     cv2.imwrite(str(output_path), result_img)

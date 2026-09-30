@@ -1,6 +1,6 @@
-"""Loss cho SCRFD_MBF: cls = Sigmoid Focal Loss, bbox = DIoU, kps = Smooth-L1
-(chuẩn hoá theo đường chéo box GT) — chỉ tính tại vị trí positive (gán bởi ATSS)."""
+"""Loss cho SCRFD_MBF (bbox-only): cls = Sigmoid Focal Loss, bbox = CIoU."""
 
+import math
 from typing import Dict, List
 
 import torch
@@ -13,7 +13,6 @@ from models.scrfd_utils import generate_points, flatten_head_outputs, decode_poi
 
 def sigmoid_focal_loss(logits: torch.Tensor, targets: torch.Tensor,
                         alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
-    """logits, targets: cùng shape (..., num_classes). Trả về loss chưa reduce (sum-ready)."""
     prob = logits.sigmoid()
     ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     p_t = prob * targets + (1 - prob) * (1 - targets)
@@ -24,13 +23,18 @@ def sigmoid_focal_loss(logits: torch.Tensor, targets: torch.Tensor,
     return loss
 
 
-def bbox_diou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-    """pred, target: (N, 4) xyxy. Trả về (N,) loss = 1 - DIoU."""
+def bbox_ciou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """pred, target: (N,4) xyxy. -> (N,) loss = 1 - CIoU (thêm số hạng tỉ lệ khung so với DIoU)."""
     px1, py1, px2, py2 = pred.unbind(-1)
     tx1, ty1, tx2, ty2 = target.unbind(-1)
 
-    pred_area = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
-    target_area = (tx2 - tx1).clamp(min=0) * (ty2 - ty1).clamp(min=0)
+    pred_w = (px2 - px1).clamp(min=eps)
+    pred_h = (py2 - py1).clamp(min=eps)
+    target_w = (tx2 - tx1).clamp(min=eps)
+    target_h = (ty2 - ty1).clamp(min=eps)
+
+    pred_area = pred_w * pred_h
+    target_area = target_w * target_h
 
     inter_x1 = torch.max(px1, tx1)
     inter_y1 = torch.max(py1, ty1)
@@ -53,20 +57,23 @@ def bbox_diou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) 
     t_cx, t_cy = (tx1 + tx2) / 2, (ty1 + ty2) / 2
     rho2 = (p_cx - t_cx).pow(2) + (p_cy - t_cy).pow(2)
 
-    diou = iou - rho2 / c2
-    return 1 - diou
+    v = (4 / math.pi ** 2) * (torch.atan(target_w / target_h) - torch.atan(pred_w / pred_h)).pow(2)
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + eps)
+
+    ciou = iou - rho2 / c2 - alpha * v
+    return 1 - ciou
 
 
 class SCRFDLoss(nn.Module):
-    def __init__(self, img_size: int = 640, num_classes: int = 2,
-                 lambda_cls: float = 1.0, lambda_bbox: float = 1.0, lambda_kps: float = 2.0,
+    def __init__(self, img_size: int = 640, num_classes: int = 1,
+                 lambda_cls: float = 1.0, lambda_bbox: float = 1.0,
                  topk: int = 9, anchor_scale: float = 8.0):
         super().__init__()
         self.img_size = img_size
         self.num_classes = num_classes
         self.lambda_cls = lambda_cls
         self.lambda_bbox = lambda_bbox
-        self.lambda_kps = lambda_kps
         self.topk = topk
         self.anchor_scale = anchor_scale
 
@@ -76,21 +83,19 @@ class SCRFDLoss(nn.Module):
         self.num_points_per_level = num_points_per_level
 
     def forward(self, outputs, targets: List[Dict]) -> Dict[str, torch.Tensor]:
-        cls_logits, bbox_dist, kps_offset = flatten_head_outputs(outputs)
+        cls_logits, bbox_dist = flatten_head_outputs(outputs)
         batch_size = cls_logits.shape[0]
         device = cls_logits.device
 
-        pred_boxes, pred_kps = decode_points(self.points, bbox_dist, kps_offset)
+        pred_boxes = decode_points(self.points, bbox_dist)
 
         total_cls_loss = cls_logits.new_zeros(())
         total_bbox_loss = cls_logits.new_zeros(())
-        total_kps_loss = cls_logits.new_zeros(())
         total_pos = 0
 
         for i in range(batch_size):
             gt_boxes = targets[i]["boxes"].to(device)
             gt_labels = targets[i]["labels"].to(device)
-            gt_kps = targets[i]["kps"].to(device)
 
             cls_target = cls_logits.new_zeros((cls_logits.shape[1], self.num_classes))
 
@@ -107,23 +112,10 @@ class SCRFDLoss(nn.Module):
                     cls_target[pos_mask, gt_labels[pos_gt_idx]] = 1.0
 
                     matched_boxes = gt_boxes[pos_gt_idx]
-                    matched_kps = gt_kps[pos_gt_idx]
-
                     pred_boxes_pos = pred_boxes[i][pos_mask]
-                    bbox_loss = bbox_diou_loss(pred_boxes_pos, matched_boxes).sum()
-
-                    diag = torch.sqrt(
-                        (matched_boxes[:, 2] - matched_boxes[:, 0]).pow(2)
-                        + (matched_boxes[:, 3] - matched_boxes[:, 1]).pow(2)
-                    ).clamp(min=1.0)
-                    pred_kps_pos = pred_kps[i][pos_mask]
-                    kps_diff = (pred_kps_pos - matched_kps) / diag.view(-1, 1, 1)
-                    kps_loss = F.smooth_l1_loss(
-                        kps_diff, torch.zeros_like(kps_diff), reduction="sum"
-                    )
+                    bbox_loss = bbox_ciou_loss(pred_boxes_pos, matched_boxes).sum()
 
                     total_bbox_loss = total_bbox_loss + bbox_loss
-                    total_kps_loss = total_kps_loss + kps_loss
                     total_pos += num_pos
 
             cls_loss = sigmoid_focal_loss(cls_logits[i], cls_target).sum()
@@ -132,14 +124,12 @@ class SCRFDLoss(nn.Module):
         norm = max(total_pos, 1)
         cls_loss = total_cls_loss / norm
         bbox_loss = total_bbox_loss / norm
-        kps_loss = total_kps_loss / norm
 
-        loss = self.lambda_cls * cls_loss + self.lambda_bbox * bbox_loss + self.lambda_kps * kps_loss
+        loss = self.lambda_cls * cls_loss + self.lambda_bbox * bbox_loss
 
         return {
             "loss": loss,
             "cls_loss": cls_loss.detach(),
             "bbox_loss": bbox_loss.detach(),
-            "kps_loss": kps_loss.detach(),
             "num_pos": torch.tensor(float(total_pos)),
         }

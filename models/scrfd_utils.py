@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 import torch
 
-from models.scrfd_mbf import STRIDES, NUM_KPS
+from models.scrfd_mbf import STRIDES
 
 
 def generate_points(img_size: int, strides: Tuple[int, ...] = STRIDES, device=None):
@@ -33,31 +33,25 @@ def generate_points(img_size: int, strides: Tuple[int, ...] = STRIDES, device=No
     return points, strides_per_point, num_points_per_level
 
 
-def flatten_head_outputs(outputs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
-    """list[(cls,bbox,kps) per level, (B,C,H,W)] -> (cls_logits, bbox_dist, kps_offset) gộp (B,N,C)."""
-    cls_list, bbox_list, kps_list = [], [], []
-    for cls_score, bbox_dist, kps_offset in outputs:
+def flatten_head_outputs(outputs: List[Tuple[torch.Tensor, torch.Tensor]]):
+    """list[(cls,bbox) per level, (B,C,H,W)] -> (cls_logits, bbox_dist) gộp (B,N,C)."""
+    cls_list, bbox_list = [], []
+    for cls_score, bbox_dist in outputs:
         b, num_classes, h, w = cls_score.shape
         cls_list.append(cls_score.permute(0, 2, 3, 1).reshape(b, h * w, num_classes))
         bbox_list.append(bbox_dist.permute(0, 2, 3, 1).reshape(b, h * w, 4))
-        kps_list.append(kps_offset.permute(0, 2, 3, 1).reshape(b, h * w, NUM_KPS * 2))
 
     cls_logits = torch.cat(cls_list, dim=1)
     bbox_dist = torch.cat(bbox_list, dim=1)
-    kps_offset = torch.cat(kps_list, dim=1)
-    return cls_logits, bbox_dist, kps_offset
+    return cls_logits, bbox_dist
 
 
-def decode_points(points: torch.Tensor, bbox_dist: torch.Tensor, kps_offset: torch.Tensor):
-    """points(N,2) + bbox_dist/kps_offset(...,N,*) -> boxes xyxy, kps tuyệt đối."""
+def decode_points(points: torch.Tensor, bbox_dist: torch.Tensor):
+    """points(N,2) + bbox_dist(...,N,4) -> boxes xyxy."""
     px, py = points[..., 0], points[..., 1]
 
     x1 = px - bbox_dist[..., 0]
     y1 = py - bbox_dist[..., 1]
     x2 = px + bbox_dist[..., 2]
     y2 = py + bbox_dist[..., 3]
-    boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-
-    kps = kps_offset.reshape(*kps_offset.shape[:-1], NUM_KPS, 2)
-    kps = kps + torch.stack([px, py], dim=-1).unsqueeze(-2)
-    return boxes, kps
+    return torch.stack([x1, y1, x2, y2], dim=-1)

@@ -26,10 +26,10 @@ def augment_hsv(img: np.ndarray, hgain: float = 0.015, sgain: float = 0.7,
     return cv2.cvtColor(img_hsv, cv2.COLOR_HSV2RGB)
 
 
-def random_flip_lr(img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
-                    p: float = 0.5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def random_flip_lr(img: np.ndarray, boxes: np.ndarray,
+                    p: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
     if random.random() >= p:
-        return img, boxes, kps
+        return img, boxes
 
     w = img.shape[1]
     img = np.ascontiguousarray(img[:, ::-1])
@@ -38,10 +38,7 @@ def random_flip_lr(img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
         x1 = boxes[:, 0].copy()
         boxes[:, 0] = w - boxes[:, 2]
         boxes[:, 2] = w - x1
-    if kps.shape[0]:
-        kps = kps.copy()
-        kps[..., 0] = w - kps[..., 0]
-    return img, boxes, kps
+    return img, boxes
 
 
 def _transform_points(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -54,12 +51,12 @@ def _transform_points(pts: np.ndarray, M: np.ndarray) -> np.ndarray:
 
 
 def random_affine(
-    img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
+    img: np.ndarray, boxes: np.ndarray,
     degrees: float = 10.0, scale: Tuple[float, float] = (0.75, 1.25),
     translate: float = 0.10, border_value=(114, 114, 114),
     min_area_ratio: float = 0.4, min_size: float = 4.0,
 ):
-    """-> img, boxes, kps, keep_mask (loại object bị cắt mất phần lớn sau transform)."""
+    """-> img, boxes, keep_mask (loại object bị cắt mất phần lớn sau transform)."""
     h, w = img.shape[:2]
 
     center = np.eye(3, dtype=np.float32)
@@ -85,7 +82,7 @@ def random_affine(
 
     n = boxes.shape[0]
     if n == 0:
-        return img_out, boxes, kps, np.ones((0,), dtype=bool)
+        return img_out, boxes, np.ones((0,), dtype=bool)
 
     corners = np.zeros((n, 4, 2), dtype=np.float32)
     corners[:, 0] = boxes[:, [0, 1]]
@@ -95,8 +92,6 @@ def random_affine(
 
     corners_t = _transform_points(corners, M)
     new_boxes = np.concatenate([corners_t.min(axis=1), corners_t.max(axis=1)], axis=1)
-
-    kps_t = _transform_points(kps, M) if kps.shape[0] else kps
 
     new_boxes[:, [0, 2]] = new_boxes[:, [0, 2]].clip(0, w)
     new_boxes[:, [1, 3]] = new_boxes[:, [1, 3]].clip(0, h)
@@ -110,7 +105,7 @@ def random_affine(
         (new_area / (orig_area + 1e-6) > min_area_ratio)
         & (new_w > min_size) & (new_h > min_size)
     )
-    return img_out, new_boxes, kps_t, keep
+    return img_out, new_boxes, keep
 
 
 def random_jpeg_compression(img: np.ndarray, p: float = 0.3,
@@ -171,15 +166,15 @@ def random_downscale_upscale(img: np.ndarray, p: float = 0.25,
 
 
 def train_augment(
-    img: np.ndarray, boxes: np.ndarray, kps: np.ndarray,
+    img: np.ndarray, boxes: np.ndarray,
     flip_p: float = 0.5, degrees: float = 10.0, scale: Tuple[float, float] = (0.75, 1.25),
     translate: float = 0.10, hsv: Tuple[float, float, float] = (0.02, 0.8, 0.6),
     domain_robust: bool = True,
 ):
     """domain_robust=True: thêm JPEG/nhiễu/mờ/gamma/resize để mô phỏng camera thật."""
-    img, boxes, kps = random_flip_lr(img, boxes, kps, p=flip_p)
-    img, boxes, kps, keep = random_affine(
-        img, boxes, kps, degrees=degrees, scale=scale, translate=translate,
+    img, boxes = random_flip_lr(img, boxes, p=flip_p)
+    img, boxes, keep = random_affine(
+        img, boxes, degrees=degrees, scale=scale, translate=translate,
     )
     img = augment_hsv(img, *hsv)
 
@@ -192,6 +187,5 @@ def train_augment(
 
     if boxes.shape[0]:
         boxes = boxes[keep]
-        kps = kps[keep]
 
-    return img, boxes, kps, keep
+    return img, boxes, keep

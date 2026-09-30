@@ -15,7 +15,7 @@ from models.scrfd_utils import generate_points, flatten_head_outputs, decode_poi
 
 
 class SCRFDONNXWrapper(nn.Module):
-    """Input (1,3,H,W) [0,1] -> scores(1,N,C) sigmoid, boxes(1,N,4) xyxy, kps(1,N,4,2)."""
+    """Input (1,3,H,W) [0,1] -> scores(1,N,C) sigmoid, boxes(1,N,4) xyxy."""
 
     def __init__(self, model: SCRFD_MBF, img_size: int):
         super().__init__()
@@ -25,10 +25,10 @@ class SCRFDONNXWrapper(nn.Module):
 
     def forward(self, x):
         outputs = self.model(x)
-        cls_logits, bbox_dist, kps_offset = flatten_head_outputs(outputs)
+        cls_logits, bbox_dist = flatten_head_outputs(outputs)
         scores = cls_logits.sigmoid()
-        boxes, kps = decode_points(self.points, bbox_dist, kps_offset)
-        return scores, boxes, kps
+        boxes = decode_points(self.points, bbox_dist)
+        return scores, boxes
 
 
 def parse_args():
@@ -39,6 +39,7 @@ def parse_args():
     p.add_argument("--width-mult", type=float, default=0.0, help="0 = lấy theo checkpoint")
     p.add_argument("--fpn-channels", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--num-classes", type=int, default=0, help="0 = lấy theo checkpoint")
+    p.add_argument("--stacked-convs", type=int, default=0, help="0 = lấy theo checkpoint")
     p.add_argument("--opset", type=int, default=18)
     p.add_argument("--dynamic-batch", action="store_true")
     p.add_argument("--ov", action="store_true", help="Convert thêm sang OpenVINO IR (.xml/.bin)")
@@ -54,15 +55,17 @@ def main():
 
     img_size = args.img_size or ckpt_args.get("img_size", 640)
     width_mult = args.width_mult or ckpt_args.get("width_mult", 1.0)
-    fpn_channels = args.fpn_channels or ckpt_args.get("fpn_channels", 32)
+    fpn_channels = args.fpn_channels or ckpt_args.get("fpn_channels", 48)
     num_classes = args.num_classes or ckpt_args.get("num_classes", 1)
+    stacked_convs = args.stacked_convs or ckpt_args.get("stacked_convs", 2)
 
     print(f"[config] img_size={img_size} width_mult={width_mult} "
-          f"fpn_channels={fpn_channels} num_classes={num_classes}")
+          f"fpn_channels={fpn_channels} num_classes={num_classes} stacked_convs={stacked_convs}")
     if "det_metrics" in ckpt:
         print(f"[checkpoint] epoch={ckpt.get('epoch')} det_metrics={ckpt['det_metrics']}")
 
-    model = SCRFD_MBF(width_mult=width_mult, fpn_channels=fpn_channels, num_classes=num_classes)
+    model = SCRFD_MBF(width_mult=width_mult, fpn_channels=fpn_channels, num_classes=num_classes,
+                       stacked_convs=stacked_convs)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -80,13 +83,12 @@ def main():
             "image": {0: "batch"},
             "scores": {0: "batch"},
             "boxes": {0: "batch"},
-            "kps": {0: "batch"},
         }
 
     with torch.no_grad():
         torch.onnx.export(
             wrapper, dummy, str(output_path),
-            input_names=["image"], output_names=["scores", "boxes", "kps"],
+            input_names=["image"], output_names=["scores", "boxes"],
             opset_version=args.opset, dynamic_axes=dynamic_axes,
             do_constant_folding=True,
         )
@@ -113,14 +115,12 @@ def export_openvino(onnx_path: Path, dummy: torch.Tensor, fp16: bool):
     ov_out = compiled(dummy.numpy())
     ov_scores = ov_out[compiled.output("scores")]
     ov_boxes = ov_out[compiled.output("boxes")]
-    ov_kps = ov_out[compiled.output("kps")]
 
     import onnxruntime as ort
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    onnx_scores, onnx_boxes, onnx_kps = sess.run(None, {"image": dummy.numpy()})
+    onnx_scores, onnx_boxes = sess.run(None, {"image": dummy.numpy()})
 
-    for name, a, b in [("scores", onnx_scores, ov_scores), ("boxes", onnx_boxes, ov_boxes),
-                        ("kps", onnx_kps, ov_kps)]:
+    for name, a, b in [("scores", onnx_scores, ov_scores), ("boxes", onnx_boxes, ov_boxes)]:
         max_diff = np.abs(a - b).max()
         tol = 1e-2 if fp16 else 1e-4
         ok = np.allclose(a, b, atol=tol, rtol=1e-2 if fp16 else 1e-3)
@@ -152,7 +152,7 @@ def verify(wrapper: nn.Module, onnx_path: Path, dummy: torch.Tensor):
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     ort_out = sess.run(None, {"image": dummy.numpy()})
 
-    names = ["scores", "boxes", "kps"]
+    names = ["scores", "boxes"]
     all_close = True
     for name, t_out, o_out in zip(names, torch_out, ort_out):
         t_np = t_out.numpy()

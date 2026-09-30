@@ -1,4 +1,4 @@
-"""SCRFD-MBF: backbone MobileFaceNet-style + head 4 keypoint góc biển số.
+"""SCRFD-MBF: backbone MobileFaceNet-style + head anchor-free (bbox only).
 
 Kiến trúc: xem docs/architecture/SCRFD-MBF-LP-4KPS.md
 """
@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-NUM_KPS = 4
 STRIDES = (8, 16, 32)
 
 
@@ -87,7 +86,7 @@ class MBFBackbone(nn.Module):
 
 
 class PAFPN(nn.Module):
-    def __init__(self, in_channels: Tuple[int, int, int], out_channels: int = 64):
+    def __init__(self, in_channels: Tuple[int, int, int], out_channels: int = 48):
         super().__init__()
         self.lateral = nn.ModuleList([
             nn.Conv2d(c, out_channels, 1) for c in in_channels
@@ -131,7 +130,7 @@ class ScaleExp(nn.Module):
 
 
 class SCRFDHead(nn.Module):
-    def __init__(self, in_channels: int = 32, stacked_convs: int = 1, num_groups: int = 8,
+    def __init__(self, in_channels: int = 48, stacked_convs: int = 2, num_groups: int = 8,
                  num_classes: int = 1):
         super().__init__()
         self.num_classes = num_classes
@@ -148,19 +147,16 @@ class SCRFDHead(nn.Module):
 
         self.cls_stem = make_stem()
         self.bbox_stem = make_stem()
-        self.kps_stem = make_stem()
 
         self.cls_pred = nn.Conv2d(in_channels, num_classes, 3, 1, 1)
         self.bbox_pred = nn.Conv2d(in_channels, 4, 3, 1, 1)
-        self.kps_pred = nn.Conv2d(in_channels, NUM_KPS * 2, 3, 1, 1)
 
         self.bbox_scales = nn.ModuleList([ScaleExp(1.0) for _ in STRIDES])
-        self.kps_scales = nn.ModuleList([ScaleExp(1.0) for _ in STRIDES])
 
         self._init_weights()
 
     def _init_weights(self):
-        for m in [self.cls_pred, self.bbox_pred, self.kps_pred]:
+        for m in [self.cls_pred, self.bbox_pred]:
             nn.init.normal_(m.weight, std=0.01)
             nn.init.zeros_(m.bias)
         prior_prob = 0.01
@@ -174,21 +170,20 @@ class SCRFDHead(nn.Module):
         bbox_dist = self.bbox_pred(self.bbox_stem(feat))
         bbox_dist = F.relu(self.bbox_scales[level_idx](bbox_dist)) * stride
 
-        kps_offset = self.kps_pred(self.kps_stem(feat))
-        kps_offset = self.kps_scales[level_idx](kps_offset) * stride
-
-        return cls_score, bbox_dist, kps_offset
+        return cls_score, bbox_dist
 
     def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
         return [self.forward_single(feat, i) for i, feat in enumerate(feats)]
 
 
 class SCRFD_MBF(nn.Module):
-    def __init__(self, width_mult: float = 1.0, fpn_channels: int = 32, num_classes: int = 1):
+    def __init__(self, width_mult: float = 1.0, fpn_channels: int = 48, num_classes: int = 1,
+                 stacked_convs: int = 2):
         super().__init__()
         self.backbone = MBFBackbone(width_mult=width_mult)
         self.neck = PAFPN(self.backbone.out_channels, out_channels=fpn_channels)
-        self.head = SCRFDHead(in_channels=fpn_channels, num_classes=num_classes)
+        self.head = SCRFDHead(in_channels=fpn_channels, num_classes=num_classes,
+                               stacked_convs=stacked_convs)
         self.strides = STRIDES
         self.num_classes = num_classes
 
@@ -199,11 +194,11 @@ class SCRFD_MBF(nn.Module):
 
     @torch.no_grad()
     def decode(self, outputs, score_thr: float = 0.3):
-        """-> list[(boxes[N,4], scores[N], labels[N], kps[N,4,2])] theo batch. Chưa NMS."""
+        """-> list[(boxes[N,4], scores[N], labels[N])] theo batch. Chưa NMS."""
         batch_size = outputs[0][0].shape[0]
         results = [[] for _ in range(batch_size)]
 
-        for level_idx, (cls_score, bbox_dist, kps_offset) in enumerate(outputs):
+        for level_idx, (cls_score, bbox_dist) in enumerate(outputs):
             stride = self.strides[level_idx]
             b, num_classes, h, w = cls_score.shape
 
@@ -219,7 +214,6 @@ class SCRFD_MBF(nn.Module):
             py = (yv.reshape(-1).float() + 0.5) * stride
 
             bbox_dist = bbox_dist.permute(0, 2, 3, 1).reshape(b, h * w, 4)
-            kps_offset = kps_offset.permute(0, 2, 3, 1).reshape(b, h * w, NUM_KPS * 2)
 
             x1 = px - bbox_dist[..., 0]
             y1 = py - bbox_dist[..., 1]
@@ -227,49 +221,32 @@ class SCRFD_MBF(nn.Module):
             y2 = py + bbox_dist[..., 3]
             boxes = torch.stack([x1, y1, x2, y2], dim=-1)
 
-            kps = kps_offset.reshape(b, h * w, NUM_KPS, 2)
-            kps = kps + torch.stack([px, py], dim=-1).reshape(1, h * w, 1, 2)
-
             for bi in range(b):
                 mask = scores[bi] > score_thr
                 if mask.any():
-                    results[bi].append((
-                        boxes[bi][mask], scores[bi][mask], labels[bi][mask], kps[bi][mask]
-                    ))
+                    results[bi].append((boxes[bi][mask], scores[bi][mask], labels[bi][mask]))
 
         final = []
         for r in results:
             if not r:
                 final.append((
-                    torch.zeros((0, 4)), torch.zeros((0,)), torch.zeros((0,), dtype=torch.long),
-                    torch.zeros((0, NUM_KPS, 2))
+                    torch.zeros((0, 4)), torch.zeros((0,)), torch.zeros((0,), dtype=torch.long)
                 ))
                 continue
             boxes = torch.cat([x[0] for x in r], dim=0)
             scores = torch.cat([x[1] for x in r], dim=0)
             labels = torch.cat([x[2] for x in r], dim=0)
-            kps = torch.cat([x[3] for x in r], dim=0)
-            final.append((boxes, scores, labels, kps))
+            final.append((boxes, scores, labels))
         return final
 
 
-def sort_corners(kps: torch.Tensor) -> torch.Tensor:
-    """kps: (N,4,2) -> sắp lại theo góc quanh centroid, thứ tự cyclic nhất quán."""
-    centroid = kps.mean(dim=1, keepdim=True)
-    vec = kps - centroid
-    angles = torch.atan2(vec[..., 1], vec[..., 0])
-    order = torch.argsort(angles, dim=1)
-    return torch.gather(kps, 1, order.unsqueeze(-1).expand(-1, -1, 2))
-
-
 if __name__ == "__main__":
-    model = SCRFD_MBF(width_mult=1.0, fpn_channels=32, num_classes=1)
+    model = SCRFD_MBF(width_mult=1.0, fpn_channels=48, num_classes=1, stacked_convs=2)
     dummy = torch.randn(1, 3, 640, 640)
     outs = model(dummy)
-    for i, (cls_s, bbox_d, kps_o) in enumerate(outs):
-        print(f"Level {i} (stride {STRIDES[i]}): cls={tuple(cls_s.shape)} "
-              f"bbox={tuple(bbox_d.shape)} kps={tuple(kps_o.shape)}")
+    for i, (cls_s, bbox_d) in enumerate(outs):
+        print(f"Level {i} (stride {STRIDES[i]}): cls={tuple(cls_s.shape)} bbox={tuple(bbox_d.shape)}")
 
     decoded = model.decode(outs, score_thr=0.0)
-    boxes, scores, labels, kps = decoded[0]
+    boxes, scores, labels = decoded[0]
     print("Decoded boxes shape:", boxes.shape, "labels shape:", labels.shape)

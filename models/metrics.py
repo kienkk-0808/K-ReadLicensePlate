@@ -1,12 +1,10 @@
-"""Đánh giá detection thật: mAP@0.5 (box) + NME keypoint (trên các match true-positive)."""
+"""Đánh giá detection thật: mAP@0.5 và mAP@0.75 (bbox-only)."""
 
 from typing import Dict, List
 
 import numpy as np
 import torch
 from torchvision.ops import batched_nms, box_iou
-
-from models.scrfd_mbf import NUM_KPS
 
 
 def _voc_ap(recall: np.ndarray, precision: np.ndarray) -> float:
@@ -19,46 +17,8 @@ def _voc_ap(recall: np.ndarray, precision: np.ndarray) -> float:
     return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
 
 
-@torch.no_grad()
-def evaluate_metrics(
-    model, val_loader, device,
-    score_thr: float = 0.05, nms_iou: float = 0.5, map_iou: float = 0.5,
-    num_classes: int = 1,
-) -> Dict[str, float]:
-    """-> {"mAP50", "kps_nme", "AP50_class_<i>"}. mAP50 cao tốt, kps_nme thấp tốt."""
-    model.eval()
-
-    gt_records: Dict[int, List[dict]] = {c: [] for c in range(num_classes)}
-    pred_records: Dict[int, List[dict]] = {c: [] for c in range(num_classes)}
-
-    img_idx = 0
-    for imgs, targets in val_loader:
-        imgs = imgs.to(device)
-        outputs = model(imgs)
-        decoded = model.decode(outputs, score_thr=score_thr)
-
-        for i, (boxes, scores, labels, kps) in enumerate(decoded):
-            if boxes.shape[0] > 0:
-                keep = batched_nms(boxes, scores, labels, nms_iou)
-                boxes, scores, labels, kps = boxes[keep], scores[keep], labels[keep], kps[keep]
-
-            for b, s, l, k in zip(boxes, scores, labels, kps):
-                pred_records[int(l.item())].append({
-                    "score": float(s.item()), "box": b.cpu().numpy(),
-                    "kps": k.cpu().numpy(), "image_idx": img_idx,
-                })
-
-            gt_boxes = targets[i]["boxes"].numpy()
-            gt_labels = targets[i]["labels"].numpy()
-            gt_kps = targets[i]["kps"].numpy()
-            for b, l, k in zip(gt_boxes, gt_labels, gt_kps):
-                gt_records[int(l)].append({"image_idx": img_idx, "box": b, "kps": k})
-
-            img_idx += 1
-
+def _compute_map(gt_records, pred_records, num_classes, iou_thr) -> float:
     ap_per_class = {}
-    all_tp_kps_err = []
-
     for c in range(num_classes):
         gts = gt_records[c]
         preds = sorted(pred_records[c], key=lambda x: -x["score"])
@@ -89,16 +49,9 @@ def evaluate_metrics(
                 best_iou = float(ious[best_local])
                 best_gi = candidate_idx[best_local]
 
-            if best_iou >= map_iou and best_gi >= 0 and not matched[best_gi]:
+            if best_iou >= iou_thr and best_gi >= 0 and not matched[best_gi]:
                 tp[pi] = 1
                 matched[best_gi] = True
-
-                gt_box = gts[best_gi]["box"]
-                gt_kps = gts[best_gi]["kps"]
-                diag = np.sqrt((gt_box[2] - gt_box[0]) ** 2 + (gt_box[3] - gt_box[1]) ** 2)
-                diag = max(diag, 1.0)
-                err = np.linalg.norm(p["kps"] - gt_kps, axis=-1).mean() / diag
-                all_tp_kps_err.append(err)
             else:
                 fp[pi] = 1
 
@@ -109,12 +62,46 @@ def evaluate_metrics(
         ap_per_class[c] = _voc_ap(recall, precision) if len(preds) else 0.0
 
     valid_aps = [v for v in ap_per_class.values() if v is not None]
-    map50 = float(np.mean(valid_aps)) if valid_aps else 0.0
-    kps_nme = float(np.mean(all_tp_kps_err)) if all_tp_kps_err else float("inf")
+    return float(np.mean(valid_aps)) if valid_aps else 0.0
+
+
+@torch.no_grad()
+def evaluate_metrics(
+    model, val_loader, device,
+    score_thr: float = 0.05, nms_iou: float = 0.5, map_iou: float = 0.5,
+    num_classes: int = 1,
+) -> Dict[str, float]:
+    """-> {"mAP50", "mAP75"}. Càng cao càng tốt."""
+    model.eval()
+
+    gt_records: Dict[int, List[dict]] = {c: [] for c in range(num_classes)}
+    pred_records: Dict[int, List[dict]] = {c: [] for c in range(num_classes)}
+
+    img_idx = 0
+    for imgs, targets in val_loader:
+        imgs = imgs.to(device)
+        outputs = model(imgs)
+        decoded = model.decode(outputs, score_thr=score_thr)
+
+        for i, (boxes, scores, labels) in enumerate(decoded):
+            if boxes.shape[0] > 0:
+                keep = batched_nms(boxes, scores, labels, nms_iou)
+                boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            for b, s, l in zip(boxes, scores, labels):
+                pred_records[int(l.item())].append({
+                    "score": float(s.item()), "box": b.cpu().numpy(), "image_idx": img_idx,
+                })
+
+            gt_boxes = targets[i]["boxes"].numpy()
+            gt_labels = targets[i]["labels"].numpy()
+            for b, l in zip(gt_boxes, gt_labels):
+                gt_records[int(l)].append({"image_idx": img_idx, "box": b})
+
+            img_idx += 1
+
+    map50 = _compute_map(gt_records, pred_records, num_classes, map_iou)
+    map75 = _compute_map(gt_records, pred_records, num_classes, 0.75)
 
     model.train()
-
-    result = {"mAP50": map50, "kps_nme": kps_nme}
-    for c, ap in ap_per_class.items():
-        result[f"AP50_class_{c}"] = ap if ap is not None else float("nan")
-    return result
+    return {"mAP50": map50, "mAP75": map75}
