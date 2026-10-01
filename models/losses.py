@@ -1,4 +1,4 @@
-"""Loss cho SCRFD_MBF (bbox-only): cls = Sigmoid Focal Loss, bbox = CIoU + DFL."""
+"""Loss cho SCRFD_MBF (bbox-only): cls = Quality Focal Loss (target=IoU thật), bbox = CIoU + DFL."""
 
 import math
 from typing import Dict, List
@@ -11,16 +11,32 @@ from models.atss_assigner import atss_assign
 from models.scrfd_utils import generate_points, flatten_head_outputs, decode_points
 
 
-def sigmoid_focal_loss(logits: torch.Tensor, targets: torch.Tensor,
-                        alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
+def quality_focal_loss(logits: torch.Tensor, targets: torch.Tensor, beta: float = 2.0) -> torch.Tensor:
+    """targets liên tục [0,1] (IoU thật cho positive, 0 cho negative) thay vì 0/1 cứng —
+    giúp score cls phản ánh đúng độ khít của box, tránh NMS giữ nhầm box tệ có score cao
+    (quan sát thực tế: box chỉ bắt được nửa biển số lại có score cao hơn box đúng đủ)."""
     prob = logits.sigmoid()
-    ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    p_t = prob * targets + (1 - prob) * (1 - targets)
-    loss = ce_loss * ((1 - p_t) ** gamma)
-    if alpha >= 0:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        loss = alpha_t * loss
-    return loss
+    scale_factor = (targets - prob).abs().pow(beta)
+    loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    return loss * scale_factor
+
+
+def box_iou_matched(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """pred, target: (N,4) xyxy, đã match theo cặp (không phải ma trận N×M). -> (N,) IoU."""
+    px1, py1, px2, py2 = pred.unbind(-1)
+    tx1, ty1, tx2, ty2 = target.unbind(-1)
+
+    pred_area = (px2 - px1).clamp(min=0) * (py2 - py1).clamp(min=0)
+    target_area = (tx2 - tx1).clamp(min=0) * (ty2 - ty1).clamp(min=0)
+
+    inter_x1 = torch.max(px1, tx1)
+    inter_y1 = torch.max(py1, ty1)
+    inter_x2 = torch.min(px2, tx2)
+    inter_y2 = torch.min(py2, ty2)
+    inter = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+
+    union = pred_area + target_area - inter + eps
+    return inter / union
 
 
 def bbox_ciou_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
@@ -87,7 +103,7 @@ def dfl_loss(pred_logits: torch.Tensor, target: torch.Tensor, reg_max: int) -> t
 class SCRFDLoss(nn.Module):
     def __init__(self, img_size: int = 640, num_classes: int = 1,
                  lambda_cls: float = 1.0, lambda_bbox: float = 1.0, lambda_dfl: float = 0.25,
-                 reg_max: int = 16, topk: int = 9, anchor_scale: float = 8.0):
+                 reg_max: int = 16, topk: int = 9, anchor_scale: float = 8.0, qfl_beta: float = 2.0):
         super().__init__()
         self.img_size = img_size
         self.num_classes = num_classes
@@ -97,6 +113,7 @@ class SCRFDLoss(nn.Module):
         self.reg_max = reg_max
         self.topk = topk
         self.anchor_scale = anchor_scale
+        self.qfl_beta = qfl_beta
 
         points, strides_per_point, num_points_per_level = generate_points(img_size)
         self.register_buffer("points", points)
@@ -131,10 +148,13 @@ class SCRFDLoss(nn.Module):
 
                 if num_pos > 0:
                     pos_gt_idx = assigned_gt_inds[pos_mask] - 1
-                    cls_target[pos_mask, gt_labels[pos_gt_idx]] = 1.0
-
                     matched_boxes = gt_boxes[pos_gt_idx]
                     pred_boxes_pos = pred_boxes[i][pos_mask]
+
+                    with torch.no_grad():
+                        iou_target = box_iou_matched(pred_boxes_pos, matched_boxes).clamp(0, 1)
+                    cls_target[pos_mask, gt_labels[pos_gt_idx]] = iou_target
+
                     bbox_loss = bbox_ciou_loss(pred_boxes_pos, matched_boxes).sum()
 
                     pos_points = self.points[pos_mask]
@@ -152,7 +172,7 @@ class SCRFDLoss(nn.Module):
                     total_dfl_loss = total_dfl_loss + dfl
                     total_pos += num_pos
 
-            cls_loss = sigmoid_focal_loss(cls_logits[i], cls_target).sum()
+            cls_loss = quality_focal_loss(cls_logits[i], cls_target, beta=self.qfl_beta).sum()
             total_cls_loss = total_cls_loss + cls_loss
 
         norm = max(total_pos, 1)

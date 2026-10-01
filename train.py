@@ -49,6 +49,7 @@ def parse_args():
     p.add_argument("--lambda-cls", type=float, default=1.0)
     p.add_argument("--lambda-bbox", type=float, default=1.0)
     p.add_argument("--lambda-dfl", type=float, default=0.25)
+    p.add_argument("--qfl-beta", type=float, default=2.0)
     return p.parse_args()
 
 
@@ -124,7 +125,7 @@ def main():
     loss_fn = SCRFDLoss(
         img_size=args.img_size, num_classes=args.num_classes,
         lambda_cls=args.lambda_cls, lambda_bbox=args.lambda_bbox, lambda_dfl=args.lambda_dfl,
-        reg_max=args.reg_max,
+        reg_max=args.reg_max, qfl_beta=args.qfl_beta,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
